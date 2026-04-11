@@ -1,0 +1,28 @@
+# Secrets & local config
+.env
+config.yaml
+
+# Runtime state
+logs/
+state/
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
