@@ -122,21 +122,54 @@ print(json.dumps(body))
 PYEOF
     ) || return 1
 
-    local resp
-    resp=$(printf '%s' "$payload" | curl -sS --max-time 90 \
+    # Call the Anthropic-compatible /v1/messages endpoint. We send both
+    # `x-api-key` (Anthropic-native) and `Authorization: Bearer` (MiniMax-
+    # native) headers so the same code works regardless of which convention
+    # the proxy expects. We capture the HTTP status via -w and write the
+    # body to a temp file so we can surface the real error when it isn't a
+    # clean 200.
+    local body_file err_file http_code curl_rc
+    body_file="$(mktemp)"
+    err_file="$(mktemp)"
+    set +e
+    http_code=$(printf '%s' "$payload" | curl -sS --max-time 90 \
+              -o "$body_file" \
+              -w '%{http_code}' \
               "${AI_FIX_URL%/}/v1/messages" \
               -H "x-api-key: $AI_FIX_KEY" \
+              -H "Authorization: Bearer $AI_FIX_KEY" \
               -H "anthropic-version: 2023-06-01" \
               -H "content-type: application/json" \
-              --data-binary @- 2>&1) || {
-        echo "ERR: curl failed: ${resp:0:200}" >&2
+              --data-binary @- 2> "$err_file")
+    curl_rc=$?
+    set -e
+
+    if [ "$curl_rc" -ne 0 ]; then
+        {
+            echo "ERR: curl failed (rc=$curl_rc) calling ${AI_FIX_URL%/}/v1/messages"
+            head -c 500 "$err_file" 2>/dev/null
+        } >&2
+        rm -f "$body_file" "$err_file"
         return 1
-    }
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        {
+            echo "ERR: HTTP $http_code from ${AI_FIX_URL%/}/v1/messages"
+            echo "body: $(head -c 500 "$body_file" 2>/dev/null)"
+        } >&2
+        rm -f "$body_file" "$err_file"
+        return 1
+    fi
 
     # Extract the assistant text block and pull out the embedded JSON fix.
-    printf '%s' "$resp" | python3 - <<'PYEOF'
-import json, sys
-raw = sys.stdin.read()
+    RESP_FILE="$body_file" python3 - <<'PYEOF'
+import json, os, sys
+with open(os.environ["RESP_FILE"], "r", errors="replace") as f:
+    raw = f.read()
+if not raw.strip():
+    print("ERR: empty response body from API", file=sys.stderr)
+    sys.exit(1)
 try:
     obj = json.loads(raw)
 except Exception as e:
@@ -168,6 +201,9 @@ if not isinstance(fix, dict):
     sys.exit(1)
 print(json.dumps(fix))
 PYEOF
+    local parse_rc=$?
+    rm -f "$body_file" "$err_file"
+    return $parse_rc
 }
 
 run_with_ai_fix() {
@@ -327,13 +363,16 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-info "Upgrading pip..."
-if ! run_with_ai_fix "upgrade pip" pip install --upgrade pip; then
-    err "pip upgrade failed."
+info "Upgrading pip / setuptools / wheel..."
+if ! run_with_ai_fix "upgrade pip toolchain" pip install --upgrade pip setuptools wheel; then
+    err "pip toolchain upgrade failed."
     exit 1
 fi
 info "Installing dependencies (this may take a minute)..."
-if ! run_with_ai_fix "install requirements" pip install -r requirements.txt; then
+# --prefer-binary makes pip pick prebuilt wheels when available, avoiding
+# source builds for Rust-backed packages like `jiter` (an anthropic
+# transitive dep) on platforms where Rust/maturin isn't installed.
+if ! run_with_ai_fix "install requirements" pip install --prefer-binary -r requirements.txt; then
     err "Dependency install failed. See the log above."
     exit 1
 fi
