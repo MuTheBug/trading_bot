@@ -70,22 +70,33 @@ After writing `.env`, the installer offers a connectivity check that:
 Any failure is reported immediately so you don't discover typos an hour into
 your first run.
 
-### AI-assisted error recovery
+### AI-assisted install pipeline
 
-`./install.sh --ai-fix` (or answering "yes" to the prompt) wraps the
-failure-prone steps — creating the venv, upgrading pip, installing
-`requirements.txt` — with a self-healing loop. If any of those steps fail,
-the installer sends the failing command + the last ~4 KB of the error log to
-MiniMax-M2.7 via the Anthropic-compatible API and asks it to propose a
-minimal sequence of shell commands that fix the underlying issue (for
-example `sudo apt install python3-venv` when `python3 -m venv` fails because
-the `venv` module is not installed, or `sudo apt install build-essential`
-when a wheel fails to build).
+`./install.sh --ai-fix` (or answering "yes" to the prompt) turns on two
+MiniMax-M2.7 touchpoints:
 
-Every suggested command is printed and requires an explicit `y` before it
-runs — nothing is executed silently. The loop retries up to 3 times per
-step. AI auto-fix is strictly opt-in and the API key is never written to
-disk unless you also supply it for the trading bot itself.
+1. **Preflight scan** — before the venv is created, the installer collects
+   an OS snapshot (distro, arch, package manager, Python version, `gcc` /
+   `make` / `rustc` / `cargo` / `python3-venv` module availability, sudo
+   status) and sends it to MiniMax-M2.7. The model returns a minimal list
+   of setup commands tailored to the distro (e.g. `sudo apt-get install -y
+   python3-venv build-essential` on Debian, `sudo dnf install -y gcc
+   openssl-devel libffi-devel` on RHEL) which are **auto-applied** so the
+   missing deps are in place before the install starts.
+
+2. **Retry loop** — if creating the venv, upgrading pip, or installing
+   requirements still fails, the error log is sent back to MiniMax-M2.7
+   which proposes a fix; the loop retries each step up to 3 times.
+
+Suggested commands are **auto-accepted** (no per-command y/N prompt) but
+every command is printed before execution and filtered through a denylist
+of obviously destructive patterns (`rm -rf /`, `mkfs`, `dd` to block
+devices, `shutdown`, `reboot`, `chmod 777 /`, fork bombs, unknown
+`curl | sh` targets). If any command in a plan matches the denylist, the
+whole plan is rejected and the step aborts.
+
+AI auto-fix is strictly opt-in and the API key is never written to disk
+unless you also supply it for the trading bot itself.
 
 ## Run
 

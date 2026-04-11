@@ -24,12 +24,19 @@ Creates a Python venv, installs dependencies, and interactively asks for:
 
 Writes .env (chmod 600) and config.yaml. Re-run with --force to overwrite.
 
---ai-fix    Enable AI-assisted error recovery without prompting. When a
-            failure-prone step (venv, pip install) fails, the error log is
-            sent to MiniMax-M2.7 which proposes shell commands to fix the
-            issue. Every command is shown before it runs; nothing executes
-            without your approval. Reads the key from ANTHROPIC_API_KEY if
-            set, otherwise prompts you.
+--ai-fix    Enable AI-assisted install pipeline:
+              1. Preflight scan — collects OS, package manager, Python,
+                 gcc/make/rustc/cargo availability, venv module status —
+                 sends it to MiniMax-M2.7 and auto-applies any suggested
+                 environment prep commands.
+              2. Retry loop — if venv / pip-upgrade / pip-install fails,
+                 the error log is sent to MiniMax-M2.7 and the suggested
+                 fix commands are auto-applied.
+            All suggested commands are printed before execution and are
+            filtered against a denylist of obviously destructive patterns
+            (rm -rf /, mkfs, dd, shutdown, fork bombs, chmod 777 /) so
+            auto-accept stays safe. Reads the API key from
+            ANTHROPIC_API_KEY if set; otherwise prompts you.
 EOF
             exit 0 ;;
     esac
@@ -42,14 +49,30 @@ ok()    { echo "$(color '1;32' '[✓]') $*"; }
 err()   { echo "$(color '1;31' '[x]') $*" >&2; }
 
 # --------------------------------------------------------------------------
-# AI-assisted error recovery.
+# AI-assisted install pipeline.
 #
-# When enabled, failure-prone steps are wrapped with `run_with_ai_fix`. On
-# failure, the last ~4000 bytes of the log plus the failing command are sent
-# to MiniMax-M2.7 via the Anthropic-compatible /v1/messages endpoint using
-# plain curl (so we don't depend on the `anthropic` SDK being installed yet).
-# The model returns a JSON object with a diagnosis and a list of shell
-# commands to run. Nothing runs without the user's explicit approval.
+# When enabled, the installer has two AI touchpoints:
+#
+#   1. Preflight scan — before venv creation, it collects OS info (distro,
+#      package manager, python version, gcc/make/rustc/cargo availability,
+#      python3-venv module status) and sends it to MiniMax-M2.7, which
+#      returns a minimal list of setup_commands to auto-run. This catches
+#      common missing-deps issues (e.g. Debian without python3-venv, RHEL
+#      without rustc for jiter) BEFORE the install tries and fails.
+#
+#   2. Retry loop — each failure-prone step is wrapped with `run_with_ai_fix`.
+#      On failure, the error log + failing command is sent to MiniMax-M2.7,
+#      which returns a list of fix_commands to auto-run, then the step is
+#      retried up to AI_FIX_MAX_ATTEMPTS times.
+#
+# Suggested commands from the AI are auto-applied without a y/N prompt, but
+# every command is printed before execution and filtered against a denylist
+# of obviously destructive patterns (rm -rf /, mkfs, dd, shutdown, reboot,
+# chmod 777 /, fork bombs). If any command in a plan matches the denylist,
+# the whole plan is rejected and the step aborts.
+#
+# Uses plain `curl` to call the Anthropic-compatible /v1/messages endpoint,
+# so there is no dependency on the `anthropic` SDK being installed yet.
 # --------------------------------------------------------------------------
 AI_FIX_ENABLED=0
 AI_FIX_KEY="${ANTHROPIC_API_KEY:-}"
@@ -57,16 +80,362 @@ AI_FIX_URL="${ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}"
 AI_FIX_MODEL="${AI_MODEL:-MiniMax-M2.7}"
 AI_FIX_MAX_ATTEMPTS=3
 
+# Reject obviously destructive commands so auto-accept stays safe.
+is_command_safe() {
+    local cmd="$1"
+    case "$cmd" in
+        *"rm -rf /"*|*"rm -rf /*"*|*"rm -fr /"*|*"rm -r -f /"*) return 1 ;;
+        *"rm --recursive --force /"*) return 1 ;;
+        *"mkfs"*|*"mkfs."*) return 1 ;;
+        *"dd if="*"of=/dev/sd"*|*"dd if="*"of=/dev/nvme"*|*"dd if="*"of=/dev/hd"*) return 1 ;;
+        *"shutdown "*|*"reboot"*|*"halt "*|*"poweroff"*|*"init 0"*|*"init 6"*) return 1 ;;
+        *':(){ :|:&'*) return 1 ;;  # fork bomb
+        *"chmod -R 777 /"*|*"chmod 777 /"*) return 1 ;;
+        *"> /dev/sd"*|*"> /dev/nvme"*|*"> /dev/hd"*) return 1 ;;
+        *"chown -R"*" /"*" "*) return 1 ;;
+        *"userdel"*|*"passwd -d root"*) return 1 ;;
+        *"curl "*" | sh"*|*"curl "*" | bash"*|*"wget "*" | sh"*|*"wget "*" | bash"*)
+            # Allow only the rustup.rs canonical installer, otherwise reject.
+            case "$cmd" in
+                *"https://sh.rustup.rs"*|*"rustup.rs"*) return 0 ;;
+                *) return 1 ;;
+            esac ;;
+    esac
+    return 0
+}
+
+# Low-level call to the Anthropic-compatible /v1/messages endpoint.
+# Args: $1 = full JSON request body.
+# Stdout: the assistant's text block on success.
+# Returns non-zero on any failure (curl error, non-200, API error).
+_minimax_call() {
+    local body="$1"
+
+    if [ -z "$AI_FIX_KEY" ]; then
+        echo "ERR: AI_FIX_KEY not set" >&2
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "ERR: curl not installed; cannot call AI endpoint" >&2
+        return 1
+    fi
+
+    # Sends both `x-api-key` (Anthropic-native) and `Authorization: Bearer`
+    # (MiniMax-native) headers so the same code works against either proxy.
+    local body_file err_file http_code curl_rc
+    body_file="$(mktemp)"
+    err_file="$(mktemp)"
+    set +e
+    http_code=$(printf '%s' "$body" | curl -sS --max-time 120 \
+              -o "$body_file" \
+              -w '%{http_code}' \
+              "${AI_FIX_URL%/}/v1/messages" \
+              -H "x-api-key: $AI_FIX_KEY" \
+              -H "Authorization: Bearer $AI_FIX_KEY" \
+              -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" \
+              --data-binary @- 2> "$err_file")
+    curl_rc=$?
+    set -e
+
+    if [ "$curl_rc" -ne 0 ]; then
+        {
+            echo "ERR: curl failed (rc=$curl_rc) calling ${AI_FIX_URL%/}/v1/messages"
+            head -c 500 "$err_file" 2>/dev/null
+        } >&2
+        rm -f "$body_file" "$err_file"
+        return 1
+    fi
+
+    if [ "$http_code" != "200" ]; then
+        {
+            echo "ERR: HTTP $http_code from ${AI_FIX_URL%/}/v1/messages"
+            echo "body: $(head -c 500 "$body_file" 2>/dev/null)"
+        } >&2
+        rm -f "$body_file" "$err_file"
+        return 1
+    fi
+
+    RESP_FILE="$body_file" python3 - <<'PYEOF'
+import json, os, sys
+with open(os.environ["RESP_FILE"], "r", errors="replace") as f:
+    raw = f.read()
+if not raw.strip():
+    print("ERR: empty response body", file=sys.stderr)
+    sys.exit(1)
+try:
+    obj = json.loads(raw)
+except Exception as e:
+    print(f"ERR: response not JSON: {e}", file=sys.stderr)
+    print(f"raw: {raw[:400]}", file=sys.stderr)
+    sys.exit(1)
+if isinstance(obj, dict) and obj.get("type") == "error":
+    print(f"ERR: API error: {obj.get('error', obj)}", file=sys.stderr)
+    sys.exit(1)
+if "error" in obj and "content" not in obj:
+    print(f"ERR: API error: {obj['error']}", file=sys.stderr)
+    sys.exit(1)
+text = ""
+for b in obj.get("content", []) or []:
+    if isinstance(b, dict) and b.get("type") == "text":
+        text += b.get("text", "") or ""
+sys.stdout.write(text)
+PYEOF
+    local rc=$?
+    rm -f "$body_file" "$err_file"
+    return $rc
+}
+
+# Pull an embedded JSON object out of a text blob (tolerates prose around it).
+# Stdin: raw text. Stdout: extracted JSON object. Returns non-zero on failure.
+_extract_json_obj() {
+    python3 - <<'PYEOF'
+import json, sys
+text = sys.stdin.read().strip()
+i, j = text.find("{"), text.rfind("}")
+if i != -1 and j != -1 and j > i:
+    text = text[i:j+1]
+try:
+    obj = json.loads(text)
+except Exception as e:
+    print(f"ERR: not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(obj, dict):
+    print("ERR: extracted value is not a JSON object", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps(obj))
+PYEOF
+}
+
+# Collect a system snapshot for the preflight AI call. Pure Python stdlib.
+preflight_collect() {
+    python3 - <<'PYEOF'
+import json, os, platform, shutil, subprocess
+
+def has(c):
+    return shutil.which(c) is not None
+
+def run(args, timeout=5):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip()[:500]
+    except Exception as e:
+        return f"err: {e}"
+
+os_release = {}
+try:
+    with open("/etc/os-release") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                os_release[k] = v.strip('"').strip("'")
+except OSError:
+    pass
+
+pkg_mgr = next(
+    (m for m in ("apt-get", "dnf", "yum", "apk", "pacman", "zypper", "brew")
+     if has(m)),
+    None,
+)
+
+venv_ok = False
+venv_err = None
+try:
+    r = subprocess.run(
+        ["python3", "-c", "import venv, ensurepip"],
+        capture_output=True, text=True, timeout=5,
+    )
+    venv_ok = r.returncode == 0
+    if not venv_ok:
+        venv_err = (r.stderr or r.stdout).strip()[:300]
+except Exception as e:
+    venv_err = str(e)
+
+info = {
+    "uname": platform.platform(),
+    "arch": platform.machine(),
+    "distro": os_release.get("PRETTY_NAME") or os_release.get("NAME") or "unknown",
+    "distro_id": os_release.get("ID", "unknown"),
+    "distro_id_like": os_release.get("ID_LIKE", ""),
+    "version_id": os_release.get("VERSION_ID", ""),
+    "python_version": platform.python_version(),
+    "python_executable": shutil.which("python3") or "",
+    "pip_version": run(["python3", "-m", "pip", "--version"]),
+    "pkg_manager": pkg_mgr,
+    "has_python3_venv_module": venv_ok,
+    "venv_error": venv_err,
+    "has_curl": has("curl"),
+    "has_git": has("git"),
+    "has_make": has("make"),
+    "has_gcc": has("gcc"),
+    "has_gxx": has("g++"),
+    "has_rustc": has("rustc"),
+    "has_cargo": has("cargo"),
+    "has_libssl_headers": os.path.exists("/usr/include/openssl/ssl.h"),
+    "has_libffi_headers": os.path.exists("/usr/include/ffi.h"),
+    "is_root": (os.geteuid() == 0) if hasattr(os, "geteuid") else False,
+    "has_sudo": has("sudo"),
+}
+print(json.dumps(info))
+PYEOF
+}
+
+# Run the preflight: collect -> send to AI -> auto-execute suggested prep cmds.
+preflight_run() {
+    if [ "$AI_FIX_ENABLED" -ne 1 ] || [ -z "$AI_FIX_KEY" ]; then
+        return 0
+    fi
+
+    info "Running preflight scan (OS + toolchain)..."
+    local info_file
+    info_file="$(mktemp)"
+    if ! preflight_collect > "$info_file" 2>/dev/null; then
+        warn "Preflight collection failed — skipping AI preflight"
+        rm -f "$info_file"
+        return 0
+    fi
+
+    # Show the scan summary to the user.
+    python3 - < "$info_file" <<'PYEOF'
+import json, sys
+d = json.load(sys.stdin)
+def tick(x): return "\u2713" if x else "\u2717"
+lines = [
+    f"   distro:       {d.get('distro','?')}  [{d.get('distro_id','?')}]",
+    f"   arch:         {d.get('arch','?')}",
+    f"   python:       {d.get('python_version','?')}",
+    f"   pkg manager:  {d.get('pkg_manager','?')}",
+    f"   venv module:  {'OK' if d.get('has_python3_venv_module') else 'MISSING'}",
+    f"   curl:  {tick(d.get('has_curl'))}   git: {tick(d.get('has_git'))}   sudo: {tick(d.get('has_sudo'))}",
+    f"   gcc:   {tick(d.get('has_gcc'))}   make: {tick(d.get('has_make'))}   g++:  {tick(d.get('has_gxx'))}",
+    f"   rustc: {tick(d.get('has_rustc'))}   cargo: {tick(d.get('has_cargo'))}",
+]
+print("\n".join(lines))
+PYEOF
+
+    # Build the AI request.
+    local payload
+    payload=$(INFO_FILE="$info_file" AI_MODEL_ENV="$AI_FIX_MODEL" python3 - <<'PYEOF'
+import json, os
+with open(os.environ["INFO_FILE"]) as f:
+    info = json.load(f)
+
+system = (
+    "You are a Linux install preflight assistant. The user is about to run "
+    "a Python 3.11+ project installer that will:\n"
+    "  (1) create a venv with `python3 -m venv .venv`\n"
+    "  (2) upgrade pip + setuptools + wheel inside it\n"
+    "  (3) pip install --prefer-binary a set of libraries including "
+    "`anthropic` (which transitively pulls `jiter`, a Rust-backed JSON "
+    "parser whose wheels may be missing on some arches), `python-binance`, "
+    "`pandas`, `numpy`, `python-telegram-bot`, `loguru`, `pydantic`, "
+    "`pydantic-settings`, `PyYAML`, `aiohttp`.\n\n"
+    "Based on the system report in the user message, return the minimal "
+    "sequence of shell commands needed to prepare this system so the "
+    "installer will succeed without falling back to source builds. If the "
+    "environment already looks ready, return setup_commands=[].\n\n"
+    "Rules:\n"
+    "- Use the exact package manager reported in `pkg_manager` (apt-get, "
+    "dnf, yum, apk, pacman, zypper, brew).\n"
+    "- Prefix with `sudo` unless `is_root` is true.\n"
+    "- Non-interactive flags only: `apt-get -y`, `dnf -y`, "
+    "`apk add --no-cache`, `pacman --noconfirm -S`, etc.\n"
+    "- Never suggest destructive commands: rm -rf /, mkfs, dd to a block "
+    "device, shutdown, reboot, chmod 777 on system dirs, fork bombs, "
+    "curl-pipe-sh from untrusted hosts.\n"
+    "- Do NOT include `python3 -m venv` or `pip install` — the installer "
+    "handles those itself.\n"
+    "- Keep the list minimal (ideally 1-3 commands).\n\n"
+    "Respond with a SINGLE JSON object, no markdown, no prose:\n"
+    "{\n"
+    '  "diagnosis": "<one sentence>",\n'
+    '  "setup_commands": ["cmd1", "cmd2", ...],\n'
+    '  "confidence": 0.0-1.0\n'
+    "}"
+)
+
+body = {
+    "model": os.environ.get("AI_MODEL_ENV", "MiniMax-M2.7"),
+    "max_tokens": 1024,
+    "system": system,
+    "messages": [{"role": "user", "content": json.dumps(info)}],
+}
+print(json.dumps(body))
+PYEOF
+    ) || { rm -f "$info_file"; return 0; }
+    rm -f "$info_file"
+
+    info "Asking MiniMax-M2.7 for an environment prep plan..."
+    local text
+    if ! text=$(_minimax_call "$payload"); then
+        warn "MiniMax preflight call failed — continuing without AI prep"
+        return 0
+    fi
+
+    local plan
+    if ! plan=$(printf '%s' "$text" | _extract_json_obj); then
+        warn "Preflight response was not valid JSON — continuing"
+        return 0
+    fi
+
+    local diag cmds
+    diag=$(printf '%s' "$plan" | python3 -c \
+        'import sys,json;print(json.load(sys.stdin).get("diagnosis",""))' \
+        2>/dev/null || echo "")
+    cmds=$(printf '%s' "$plan" | python3 -c \
+'import sys,json
+obj = json.load(sys.stdin)
+for c in obj.get("setup_commands", []) or []:
+    c = str(c).strip()
+    if c:
+        print(c)' 2>/dev/null || true)
+
+    echo
+    echo "   $(color '1;36' 'Diagnosis:') ${diag:-(none)}"
+    if [ -z "$cmds" ]; then
+        ok "AI reports environment is ready — no preflight changes needed"
+        return 0
+    fi
+
+    echo "   $(color '1;36' 'Preflight commands (auto-accept):')"
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        echo "     \$ $c"
+    done <<< "$cmds"
+
+    # Safety filter: reject the whole plan if any command is denylisted.
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if ! is_command_safe "$c"; then
+            err "Refusing to auto-execute unsafe command: $c"
+            warn "Aborting AI preflight. Install will proceed without prep."
+            return 0
+        fi
+    done <<< "$cmds"
+
+    # Auto-execute.
+    local any_failed=0
+    while IFS= read -r pcmd; do
+        [ -z "$pcmd" ] && continue
+        info "Running: $pcmd"
+        if ! bash -c "$pcmd"; then
+            warn "Preflight command failed: $pcmd (continuing)"
+            any_failed=1
+        fi
+    done <<< "$cmds"
+
+    if [ "$any_failed" -eq 0 ]; then
+        ok "Preflight AI prep complete"
+    else
+        warn "Preflight had failures — continuing and relying on retry loop"
+    fi
+}
+
 ai_fix_suggest() {
     # Args: $1=step_label $2=failed_command_str $3=exit_code $4=log_file
     # Writes a JSON object {diagnosis, fix_commands, retry, confidence} to
     # stdout on success; returns non-zero on failure.
     local step="$1" cmd="$2" rc="$3" log="$4"
-
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "ERR: curl not installed; cannot call AI fix endpoint" >&2
-        return 1
-    fi
 
     local payload
     payload=$(AI_STEP="$step" AI_CMD="$cmd" AI_RC="$rc" AI_LOG_FILE="$log" \
@@ -122,88 +491,11 @@ print(json.dumps(body))
 PYEOF
     ) || return 1
 
-    # Call the Anthropic-compatible /v1/messages endpoint. We send both
-    # `x-api-key` (Anthropic-native) and `Authorization: Bearer` (MiniMax-
-    # native) headers so the same code works regardless of which convention
-    # the proxy expects. We capture the HTTP status via -w and write the
-    # body to a temp file so we can surface the real error when it isn't a
-    # clean 200.
-    local body_file err_file http_code curl_rc
-    body_file="$(mktemp)"
-    err_file="$(mktemp)"
-    set +e
-    http_code=$(printf '%s' "$payload" | curl -sS --max-time 90 \
-              -o "$body_file" \
-              -w '%{http_code}' \
-              "${AI_FIX_URL%/}/v1/messages" \
-              -H "x-api-key: $AI_FIX_KEY" \
-              -H "Authorization: Bearer $AI_FIX_KEY" \
-              -H "anthropic-version: 2023-06-01" \
-              -H "content-type: application/json" \
-              --data-binary @- 2> "$err_file")
-    curl_rc=$?
-    set -e
-
-    if [ "$curl_rc" -ne 0 ]; then
-        {
-            echo "ERR: curl failed (rc=$curl_rc) calling ${AI_FIX_URL%/}/v1/messages"
-            head -c 500 "$err_file" 2>/dev/null
-        } >&2
-        rm -f "$body_file" "$err_file"
+    local text
+    if ! text=$(_minimax_call "$payload"); then
         return 1
     fi
-
-    if [ "$http_code" != "200" ]; then
-        {
-            echo "ERR: HTTP $http_code from ${AI_FIX_URL%/}/v1/messages"
-            echo "body: $(head -c 500 "$body_file" 2>/dev/null)"
-        } >&2
-        rm -f "$body_file" "$err_file"
-        return 1
-    fi
-
-    # Extract the assistant text block and pull out the embedded JSON fix.
-    RESP_FILE="$body_file" python3 - <<'PYEOF'
-import json, os, sys
-with open(os.environ["RESP_FILE"], "r", errors="replace") as f:
-    raw = f.read()
-if not raw.strip():
-    print("ERR: empty response body from API", file=sys.stderr)
-    sys.exit(1)
-try:
-    obj = json.loads(raw)
-except Exception as e:
-    print(f"ERR: API response not JSON: {e}", file=sys.stderr)
-    print(f"raw: {raw[:400]}", file=sys.stderr)
-    sys.exit(1)
-if isinstance(obj, dict) and obj.get("type") == "error":
-    print(f"ERR: API error: {obj.get('error', obj)}", file=sys.stderr)
-    sys.exit(1)
-if "error" in obj and "content" not in obj:
-    print(f"ERR: API error: {obj['error']}", file=sys.stderr)
-    sys.exit(1)
-text = ""
-for b in obj.get("content", []) or []:
-    if isinstance(b, dict) and b.get("type") == "text":
-        text += b.get("text", "") or ""
-s = text.strip()
-i = s.find("{"); j = s.rfind("}")
-if i != -1 and j != -1 and j > i:
-    s = s[i:j+1]
-try:
-    fix = json.loads(s)
-except Exception as e:
-    print(f"ERR: AI reply did not contain valid JSON: {e}", file=sys.stderr)
-    print(f"text: {text[:400]}", file=sys.stderr)
-    sys.exit(1)
-if not isinstance(fix, dict):
-    print("ERR: AI reply JSON was not an object", file=sys.stderr)
-    sys.exit(1)
-print(json.dumps(fix))
-PYEOF
-    local parse_rc=$?
-    rm -f "$body_file" "$err_file"
-    return $parse_rc
+    printf '%s' "$text" | _extract_json_obj
 }
 
 run_with_ai_fix() {
@@ -267,13 +559,26 @@ for c in obj.get("fix_commands", []) or []:
             warn "AI had no fix to suggest — aborting this step."
             return "$rc"
         fi
-        echo "   $(color '1;36' 'Proposed fix commands:')"
-        while IFS= read -r c; do echo "     \$ $c"; done <<< "$cmds"
-        read -rp "   Apply and retry this step? [y/N]: " APPLY
-        case "${APPLY:-}" in
-            y|Y|yes|YES) ;;
-            *) warn "Skipped by user — aborting this step."; return "$rc" ;;
-        esac
+        echo "   $(color '1;36' 'Fix commands (auto-accept):')"
+        while IFS= read -r c; do
+            [ -z "$c" ] && continue
+            echo "     \$ $c"
+        done <<< "$cmds"
+
+        # Safety filter: reject the whole plan if any command is denylisted.
+        local unsafe=0
+        while IFS= read -r c; do
+            [ -z "$c" ] && continue
+            if ! is_command_safe "$c"; then
+                err "Refusing to auto-execute unsafe command: $c"
+                unsafe=1
+                break
+            fi
+        done <<< "$cmds"
+        if [ "$unsafe" -eq 1 ]; then
+            warn "Aborting this step."
+            return "$rc"
+        fi
 
         while IFS= read -r fix_cmd; do
             [ -z "$fix_cmd" ] && continue
@@ -346,6 +651,14 @@ else
         *) ;;
     esac
 fi
+
+# --- 1.6 Preflight AI environment prep -------------------------------------
+# If AI auto-fix is enabled, collect an OS/toolchain snapshot, send it to
+# MiniMax-M2.7, and auto-apply whatever setup commands it suggests BEFORE we
+# try to build the venv / install requirements. This catches classic missing
+# deps (python3-venv on Debian, build tools on RHEL, rustc for jiter on
+# arches without prebuilt wheels) before they turn into failed retries.
+preflight_run
 
 # --- 2. venv ----------------------------------------------------------------
 if [ ! -d ".venv" ]; then
