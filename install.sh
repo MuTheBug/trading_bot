@@ -17,6 +17,7 @@ Usage: ./install.sh [--force]
 Creates a Python venv, installs dependencies, and interactively asks for:
   - Binance API key / secret
   - Telegram bot token / chat id
+  - MiniMax Token Plan API key (the AI brain)
   - Default run mode (sim | live)
 
 Writes .env (chmod 600) and config.yaml. Re-run with --force to overwrite.
@@ -99,6 +100,17 @@ else
     echo
     read -rp "   Telegram Chat ID (numeric, from @userinfobot): " TG_CHAT
 
+    echo
+    info "AI brain — MiniMax Token Plan (the bot uses M2.7 to decide trades)"
+    echo "   Get a key at https://platform.minimax.io/user-center/basic-information/interface-key"
+    read -rsp "   MiniMax API Key: " MINIMAX_KEY
+    echo
+    MINIMAX_URL="https://api.minimax.io/anthropic"
+    read -rp "   MiniMax base URL (default ${MINIMAX_URL}): " MINIMAX_URL_IN
+    if [ -n "${MINIMAX_URL_IN:-}" ]; then
+        MINIMAX_URL="${MINIMAX_URL_IN}"
+    fi
+
     DEFAULT_MODE="sim"
     read -rp "   Default run mode [sim/live] (default sim): " MODE_IN
     case "${MODE_IN:-}" in
@@ -116,6 +128,9 @@ BINANCE_TESTNET=${TESTNET_VAL}
 TELEGRAM_BOT_TOKEN=${TG_TOKEN}
 TELEGRAM_CHAT_ID=${TG_CHAT}
 
+ANTHROPIC_API_KEY=${MINIMAX_KEY}
+ANTHROPIC_BASE_URL=${MINIMAX_URL}
+
 RUN_MODE=${DEFAULT_MODE}
 EOF
     chmod 600 .env
@@ -125,12 +140,87 @@ fi
 # --- 5. make run.sh executable ---------------------------------------------
 chmod +x run.sh 2>/dev/null || true
 
-# --- 6. smoke-check imports ------------------------------------------------
+# --- 6. create runtime dirs ------------------------------------------------
+mkdir -p logs state
+ok "logs/ and state/ directories ready"
+
+# --- 7. smoke-check imports ------------------------------------------------
 info "Verifying imports..."
-if python3 -c "import src.config, src.bot, src.exchange.simulator, src.strategy.trend_momentum" 2>/dev/null; then
+if python3 -c "import src.config, src.bot, src.exchange.simulator, src.strategy.ai_strategy" 2>/dev/null; then
     ok "imports OK"
 else
     warn "import check failed — run 'python3 -c \"import src.bot\"' to debug"
+fi
+
+# --- 8. optional connectivity check ----------------------------------------
+if [ -f ".env" ]; then
+    read -rp "   Run a connectivity check against Binance + Telegram + MiniMax now? [Y/n]: " CONN
+    case "${CONN:-Y}" in
+        n|N|no|NO) ;;
+        *)
+            # shellcheck disable=SC1091
+            set -a; source .env; set +a
+            info "Pinging Binance Futures..."
+            python3 - <<'PYEOF' || warn "Binance ping failed"
+import asyncio, os
+try:
+    from binance import AsyncClient
+except ImportError:
+    print("python-binance not installed"); raise SystemExit(1)
+async def main():
+    key = os.environ.get("BINANCE_API_KEY", "")
+    sec = os.environ.get("BINANCE_API_SECRET", "")
+    tn  = os.environ.get("BINANCE_TESTNET", "false").lower() == "true"
+    if not key or not sec:
+        print("(no key set, skipping auth ping)")
+        c = await AsyncClient.create(testnet=tn)
+    else:
+        c = await AsyncClient.create(api_key=key, api_secret=sec, testnet=tn)
+    try:
+        await c.futures_ping()
+        print("binance: OK")
+    finally:
+        await c.close_connection()
+asyncio.run(main())
+PYEOF
+
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+                info "Checking Telegram token..."
+                if command -v curl >/dev/null 2>&1; then
+                    TG_OUT=$(curl -s --max-time 10 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" || true)
+                    case "$TG_OUT" in
+                        *'"ok":true'*) ok "telegram: OK" ;;
+                        *) warn "telegram: bad token or network — raw: ${TG_OUT:0:200}" ;;
+                    esac
+                fi
+            fi
+
+            if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+                info "Checking MiniMax (Anthropic-compatible) API..."
+                python3 - <<'PYEOF' || warn "MiniMax API check failed"
+import os
+try:
+    from anthropic import Anthropic
+except ImportError:
+    print("anthropic SDK not installed"); raise SystemExit(1)
+c = Anthropic(
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    base_url=os.environ.get("ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"),
+)
+msg = c.messages.create(
+    model=os.environ.get("AI_MODEL", "MiniMax-M2.7"),
+    max_tokens=32,
+    messages=[{"role": "user", "content": "Reply with the single word OK."}],
+)
+text = ""
+for b in msg.content:
+    if getattr(b, "type", None) == "text":
+        text += getattr(b, "text", "")
+print(f"minimax: {text.strip()[:40] or '(empty)'}")
+PYEOF
+            fi
+            ;;
+    esac
 fi
 
 cat <<'EOF'

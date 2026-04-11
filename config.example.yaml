@@ -78,3 +78,19 @@ telegram:
   alerts_on_exit: true
   alerts_on_error: true
   daily_summary_utc_hour: 0    # post daily summary at this UTC hour
+
+# --- AI brain (MiniMax M2.7 via Anthropic-compatible API) ---
+# The AI makes the full trading decision: side, entry, SL, TP ladder, leverage.
+# Risk manager still enforces sizing, daily loss, drawdown and cooldowns as a
+# hard safety net — the AI cannot bypass them.
+ai:
+  enabled: true                # set false to fall back to the classical strategy
+  model: MiniMax-M2.7
+  max_tokens: 2048
+  thinking: false              # set true to use extended thinking (slower, more tokens)
+  max_leverage: 5              # hard cap on leverage the AI may request
+  min_confidence: 0.6          # skip trades where AI confidence is below this
+  kline_history: 80            # 15m candles fed to the model per call
+  htf_history: 40              # 1h candles fed to the model per call
+  request_timeout_s: 60
+  retries: 2

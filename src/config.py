@@ -21,6 +21,12 @@ class Secrets(BaseSettings):
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     run_mode: Literal["sim", "live"] = Field(default="sim", alias="RUN_MODE")
 
+    # MiniMax (Anthropic-compatible) API — the AI brain driving trade decisions
+    ai_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    ai_base_url: str = Field(
+        default="https://api.minimax.io/anthropic", alias="ANTHROPIC_BASE_URL"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -84,6 +90,21 @@ class TelegramConfig(BaseModel):
     daily_summary_utc_hour: int = 0
 
 
+class AIConfig(BaseModel):
+    """AI-driven strategy configuration (MiniMax M2.7 via Anthropic-compatible API)."""
+
+    enabled: bool = True
+    model: str = "MiniMax-M2.7"
+    max_tokens: int = 2048
+    thinking: bool = False  # set true to use extended thinking mode
+    max_leverage: int = 5   # hard cap on leverage the AI may request
+    min_confidence: float = 0.6  # skip signals below this confidence
+    kline_history: int = 80      # candles included in the prompt
+    htf_history: int = 40        # HTF candles included in the prompt
+    request_timeout_s: float = 60.0
+    retries: int = 2
+
+
 class BotConfig(BaseModel):
     symbols: List[str] = Field(default_factory=lambda: ["DOGEUSDT"])
     timeframe: str = "15m"
@@ -95,6 +116,7 @@ class BotConfig(BaseModel):
     exits: ExitsConfig = Field(default_factory=ExitsConfig)
     simulator: SimulatorConfig = Field(default_factory=SimulatorConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
+    ai: AIConfig = Field(default_factory=AIConfig)
     loop_interval_seconds: int = 15
     kline_history: int = 200
     log_level: str = "INFO"

@@ -20,9 +20,13 @@ from .state import (
     TakeProfitLevel,
     TradeRecord,
 )
-from .strategy.base import Signal
+from .strategy.ai_strategy import AIStrategy
+from .strategy.base import Signal, Strategy
 from .strategy.trend_momentum import TrendMomentumStrategy
 from .telegram.bot import TelegramNotifier
+
+
+_MAX_CONSECUTIVE_ERRORS = 5
 
 
 Mode = Literal["sim", "live"]
@@ -39,7 +43,7 @@ class TradingBot:
         self.config = config
         self.secrets = secrets
         self.state = StateStore(config.state_file)
-        self.strategy = TrendMomentumStrategy(config.strategy)
+        self.strategy: Strategy = self._build_strategy()
         self.risk = RiskManager(config.risk, config.exits)
         self.exchange: ExchangeInterface = self._build_exchange()
         self.telegram = TelegramNotifier(
@@ -53,6 +57,24 @@ class TradingBot:
         self._stop_event = asyncio.Event()
         # Protects state mutations that can race between loop tick & /close command
         self._lock = asyncio.Lock()
+        # Error bookkeeping
+        self._consecutive_errors = 0
+        self._last_breaker_alert: Optional[str] = None
+        # Track last candle close_time per symbol so we only consult the AI
+        # once per closed 15m candle (quota-friendly, avoids duplicate signals)
+        self._last_analyzed: Dict[str, str] = {}
+
+    def _build_strategy(self) -> Strategy:
+        if self.config.ai.enabled:
+            logger.info("Using AI strategy: {}", self.config.ai.model)
+            return AIStrategy(
+                ai_cfg=self.config.ai,
+                strategy_cfg=self.config.strategy,
+                api_key=self.secrets.ai_api_key,
+                base_url=self.secrets.ai_base_url,
+            )
+        logger.info("Using classical TrendMomentum strategy")
+        return TrendMomentumStrategy(self.config.strategy)
 
     def _build_exchange(self) -> ExchangeInterface:
         if self.mode == "live":
@@ -143,10 +165,27 @@ class TradingBot:
             while self._running:
                 try:
                     await self._tick()
+                    self._consecutive_errors = 0
                 except Exception as e:
-                    logger.exception("Tick error: {}", e)
+                    self._consecutive_errors += 1
+                    logger.exception(
+                        "Tick error ({}/{}): {}",
+                        self._consecutive_errors, _MAX_CONSECUTIVE_ERRORS, e,
+                    )
                     if self.config.telegram.alerts_on_error:
-                        await self.telegram.send(f"⚠️ Tick error: <code>{e}</code>")
+                        await self.telegram.send(
+                            f"⚠️ Tick error ({self._consecutive_errors}/"
+                            f"{_MAX_CONSECUTIVE_ERRORS}): <code>{e}</code>"
+                        )
+                    if self._consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                        if not self.state.state.paused:
+                            self.state.state.paused = True
+                            self.state.save()
+                            await self.telegram.send(
+                                "🛑 <b>Auto-paused</b> after "
+                                f"{_MAX_CONSECUTIVE_ERRORS} consecutive errors. "
+                                "Investigate logs and /resume when ready."
+                            )
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
@@ -175,8 +214,31 @@ class TradingBot:
                 ok, reason = self.risk.can_open_new(self.state, equity, sym)
                 if not ok:
                     logger.debug("Skip {}: {}", sym, reason)
+                    await self._maybe_alert_breaker(reason)
                     continue
+                # Breaker cleared? reset alert-dedupe so next trip re-alerts.
+                self._last_breaker_alert = None
                 await self._try_enter(sym, equity)
+
+    async def _maybe_alert_breaker(self, reason: str) -> None:
+        """Send a one-shot Telegram alert when a risk breaker first trips.
+
+        De-duplicated by the reason string so we don't spam the user on every
+        tick while a breaker is active.
+        """
+        key: Optional[str] = None
+        text: Optional[str] = None
+        if "daily loss" in reason:
+            key = "daily_loss"
+            text = f"🛑 <b>Daily loss limit hit</b>\nNo new entries today.\n<code>{reason}</code>"
+        elif "drawdown" in reason:
+            key = "drawdown"
+            text = f"🛑 <b>Max drawdown hit</b>\nNo new entries until recovery.\n<code>{reason}</code>"
+        if key is None or key == self._last_breaker_alert:
+            return
+        self._last_breaker_alert = key
+        if self.config.telegram.alerts_on_error and text:
+            await self.telegram.send(text)
 
     async def _manage_position(self, symbol: str) -> None:
         pos = self.state.state.positions.get(symbol)
@@ -296,12 +358,22 @@ class TradingBot:
         df1h = await self.exchange.get_klines(
             symbol, self.config.htf_timeframe, limit=max(self.config.strategy.ema_htf + 20, 100)
         )
+        if len(df15) < 3:
+            return
 
-        signal: Optional[Signal] = self.strategy.evaluate(df15, df1h)
+        # Throttle: only run the strategy once per CLOSED 15m candle per symbol.
+        # df15 is indexed by close_time; iloc[-1] is the forming candle, iloc[-2]
+        # is the most recently closed one.
+        last_closed_ts = str(df15.index[-2])
+        if self._last_analyzed.get(symbol) == last_closed_ts:
+            return
+        self._last_analyzed[symbol] = last_closed_ts
+
+        signal: Optional[Signal] = await self.strategy.evaluate(symbol, df15, df1h)
         if signal is None:
             return
 
-        # Funding check
+        # Funding check — still enforced regardless of what the AI chose.
         try:
             funding = await self.exchange.get_funding_rate(symbol)
             action = self.risk.funding_action(funding, signal.side)
@@ -311,10 +383,21 @@ class TradingBot:
         except Exception as e:
             logger.debug("funding fetch {}: {}", symbol, e)
 
-        # Build SL / TPs
-        sl, tps = self.risk.build_exit_ladder(
-            entry=signal.entry_price, side=signal.side, atr=signal.atr
-        )
+        # SL / TPs: honor AI-supplied plan if present, else fall back to ATR ladder.
+        if signal.stop_loss is not None and signal.take_profits:
+            sl = signal.stop_loss
+            tps = [
+                TakeProfitLevel(price=p, close_pct=pct)
+                for (p, pct) in signal.take_profits
+            ]
+        else:
+            sl, tps = self.risk.build_exit_ladder(
+                entry=signal.entry_price, side=signal.side, atr=signal.atr
+            )
+
+        # Leverage: AI may request a lower leverage than config (e.g. low confidence)
+        leverage = signal.leverage or self.config.leverage
+        leverage = max(1, min(leverage, self.config.leverage))
 
         # Size
         filters = await self.exchange.get_symbol_filters(symbol)
@@ -324,11 +407,18 @@ class TradingBot:
             entry_price=signal.entry_price,
             stop_price=sl,
             filters=filters,
-            leverage=self.config.leverage,
+            leverage=leverage,
         )
         if not sizing.feasible:
             logger.info("Skip {}: sizing infeasible ({})", symbol, sizing.reason)
             return
+
+        # Apply per-symbol leverage if it differs from the global default.
+        if leverage != self.config.leverage:
+            try:
+                await self.exchange.set_leverage(symbol, leverage)
+            except Exception as e:
+                logger.warning("set_leverage {} x{} failed: {}", symbol, leverage, e)
 
         # Enter
         order_side = "BUY" if signal.side == "LONG" else "SELL"
@@ -337,8 +427,19 @@ class TradingBot:
         )
         entry_price = order.avg_price or signal.entry_price
 
-        # Rebuild TP/SL around the actual fill price to stay precise
-        sl, tps = self.risk.build_exit_ladder(entry_price, signal.side, signal.atr)
+        # Rebuild exit ladder around the actual fill price:
+        # - classical path: rebuild ATR ladder off the real fill
+        # - AI path: shift SL/TP by the same offset from planned entry so the
+        #   model's structure-based levels stay intact.
+        if signal.stop_loss is not None and signal.take_profits:
+            offset = entry_price - signal.entry_price
+            sl = signal.stop_loss + offset
+            tps = [
+                TakeProfitLevel(price=p + offset, close_pct=pct)
+                for (p, pct) in signal.take_profits
+            ]
+        else:
+            sl, tps = self.risk.build_exit_ladder(entry_price, signal.side, signal.atr)
 
         pos = Position(
             symbol=symbol,
@@ -346,7 +447,7 @@ class TradingBot:
             entry_price=entry_price,
             original_qty=sizing.qty,
             remaining_qty=sizing.qty,
-            leverage=self.config.leverage,
+            leverage=leverage,
             stop_loss=sl,
             take_profits=tps,
             opened_at=datetime.now(timezone.utc).isoformat(),
@@ -356,21 +457,23 @@ class TradingBot:
         )
         self.state.add_position(pos)
 
-        # Record the entry fee as a separate "0 pnl" trade so daily fees accounting stays
-        # correct without double-counting; we attribute it to the eventual exit's PnL minus
-        # this fee implicitly — instead we just log it now and let exit trades carry fee.
         logger.info(
-            "OPEN {} {} qty={} entry={:.6f} SL={:.6f} TP1={:.6f} reason='{}'",
+            "OPEN {} {} qty={} entry={:.6f} SL={:.6f} TP1={:.6f} lev={}x reason='{}'",
             signal.side, symbol, sizing.qty, entry_price, sl,
-            tps[0].price, signal.reason,
+            tps[0].price, leverage, signal.reason,
         )
 
         if self.config.telegram.alerts_on_entry:
+            conf_str = (
+                f"\nconfidence={signal.confidence:.2f}"
+                if signal.confidence is not None else ""
+            )
             await self.telegram.send(
-                f"🚀 <b>OPEN {signal.side}</b> {symbol}\n"
+                f"🚀 <b>OPEN {signal.side}</b> {symbol} {leverage}x\n"
                 f"entry={entry_price:.6f}  qty={sizing.qty:g}\n"
                 f"SL={sl:.6f}\n"
-                f"TP1={tps[0].price:.6f}  TP2={tps[1].price:.6f}  TP3={tps[2].price:.6f}\n"
+                f"TP1={tps[0].price:.6f}  TP2={tps[1].price:.6f}  TP3={tps[2].price:.6f}"
+                f"{conf_str}\n"
                 f"<i>{signal.reason}</i>"
             )
 

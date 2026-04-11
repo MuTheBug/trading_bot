@@ -1,8 +1,14 @@
-"""Live Binance USDT-M Futures exchange via python-binance async client."""
+"""Live Binance USDT-M Futures exchange via python-binance async client.
+
+All read-only calls are wrapped in `_retry` with exponential backoff so
+transient network errors / 5xx / -1003 rate-limit responses don't crash the
+main loop. Order placement is NOT blindly retried — a timed-out order could
+already have filled. Instead we re-query positions to decide.
+"""
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 import pandas as pd
 from loguru import logger
@@ -28,6 +34,55 @@ _INTERVAL_MAP = {
     "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "8h": "8h", "12h": "12h",
     "1d": "1d",
 }
+
+
+T = TypeVar("T")
+
+
+def _is_transient(e: Exception) -> bool:
+    """Classify an error as retryable (transient network / rate-limit / 5xx)."""
+    if isinstance(e, (asyncio.TimeoutError, ConnectionError)):
+        return True
+    if isinstance(e, BinanceAPIException):
+        code = getattr(e, "code", None)
+        status = getattr(e, "status_code", None)
+        # -1003: rate limit. -1007: timeout. -1000..-1010: generic network/server.
+        if code in (-1003, -1007, -1000, -1001, -1006, -1008, -1016, -1021):
+            return True
+        if isinstance(status, int) and 500 <= status < 600:
+            return True
+    # aiohttp-level timeouts / disconnects
+    name = type(e).__name__
+    if name in ("ClientOSError", "ServerDisconnectedError", "ClientConnectorError",
+                "ClientPayloadError"):
+        return True
+    return False
+
+
+async def _retry(
+    fn: Callable[[], Awaitable[T]],
+    *,
+    attempts: int = 4,
+    base_delay: float = 1.0,
+    what: str = "binance call",
+) -> T:
+    last: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            return await fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not _is_transient(e) or i == attempts - 1:
+                raise
+            delay = base_delay * (2 ** i)
+            logger.warning(
+                "{} transient error (attempt {}/{}): {} — retrying in {}s",
+                what, i + 1, attempts, e, delay,
+            )
+            await asyncio.sleep(delay)
+    # Unreachable, but keeps type checkers happy
+    assert last is not None
+    raise last
 
 
 class BinanceLiveExchange(ExchangeInterface):
@@ -64,7 +119,9 @@ class BinanceLiveExchange(ExchangeInterface):
         return self._client
 
     async def get_balance(self) -> float:
-        balances = await self._c().futures_account_balance()
+        balances = await _retry(
+            lambda: self._c().futures_account_balance(), what="futures_account_balance"
+        )
         for b in balances:
             if b["asset"] == "USDT":
                 return float(b["balance"])
@@ -73,8 +130,11 @@ class BinanceLiveExchange(ExchangeInterface):
     async def get_klines(
         self, symbol: str, interval: str, limit: int = 200
     ) -> pd.DataFrame:
-        raw = await self._c().futures_klines(
-            symbol=symbol, interval=_INTERVAL_MAP[interval], limit=limit
+        raw = await _retry(
+            lambda: self._c().futures_klines(
+                symbol=symbol, interval=_INTERVAL_MAP[interval], limit=limit
+            ),
+            what=f"futures_klines[{symbol}]",
         )
         cols = [
             "open_time", "open", "high", "low", "close", "volume",
@@ -89,12 +149,18 @@ class BinanceLiveExchange(ExchangeInterface):
         return df[["open", "high", "low", "close", "volume"]]
 
     async def get_mark_price(self, symbol: str) -> float:
-        r = await self._c().futures_mark_price(symbol=symbol)
+        r = await _retry(
+            lambda: self._c().futures_mark_price(symbol=symbol),
+            what=f"futures_mark_price[{symbol}]",
+        )
         return float(r["markPrice"])
 
     async def get_funding_rate(self, symbol: str) -> float:
         """Return annualized funding rate in percent."""
-        r = await self._c().futures_mark_price(symbol=symbol)
+        r = await _retry(
+            lambda: self._c().futures_mark_price(symbol=symbol),
+            what=f"funding_rate[{symbol}]",
+        )
         # lastFundingRate is per 8h. Annualized: rate * 3 * 365 * 100
         rate = float(r.get("lastFundingRate", 0.0))
         return rate * 3.0 * 365.0 * 100.0
@@ -102,7 +168,9 @@ class BinanceLiveExchange(ExchangeInterface):
     async def get_symbol_filters(self, symbol: str) -> SymbolFilters:
         if symbol in self._filters_cache:
             return self._filters_cache[symbol]
-        info = await self._c().futures_exchange_info()
+        info = await _retry(
+            lambda: self._c().futures_exchange_info(), what="futures_exchange_info"
+        )
         for s in info["symbols"]:
             if s["symbol"] != symbol:
                 continue
@@ -189,7 +257,10 @@ class BinanceLiveExchange(ExchangeInterface):
         )
 
     async def get_open_positions(self) -> List[LivePosition]:
-        data = await self._c().futures_position_information()
+        data = await _retry(
+            lambda: self._c().futures_position_information(),
+            what="futures_position_information",
+        )
         out: List[LivePosition] = []
         for p in data:
             amt = float(p["positionAmt"])
