@@ -43,9 +43,11 @@ call by the model can't blow up the account.
 ## Install
 
 ```bash
-git clone <your-repo-url> trading_bot
+git clone https://github.com/MuTheBug/trading_bot.git trading_bot
 cd trading_bot
-./install.sh
+git checkout claude/binance-futures-trading-bot-JPNZ1
+./install.sh              # interactive
+./install.sh --ai-fix     # + AI-assisted error recovery
 ```
 
 The installer creates a venv, installs dependencies, copies `config.example.yaml`
@@ -67,6 +69,23 @@ After writing `.env`, the installer offers a connectivity check that:
 
 Any failure is reported immediately so you don't discover typos an hour into
 your first run.
+
+### AI-assisted error recovery
+
+`./install.sh --ai-fix` (or answering "yes" to the prompt) wraps the
+failure-prone steps — creating the venv, upgrading pip, installing
+`requirements.txt` — with a self-healing loop. If any of those steps fail,
+the installer sends the failing command + the last ~4 KB of the error log to
+MiniMax-M2.7 via the Anthropic-compatible API and asks it to propose a
+minimal sequence of shell commands that fix the underlying issue (for
+example `sudo apt install python3-venv` when `python3 -m venv` fails because
+the `venv` module is not installed, or `sudo apt install build-essential`
+when a wheel fails to build).
+
+Every suggested command is printed and requires an explicit `y` before it
+runs — nothing is executed silently. The loop retries up to 3 times per
+step. AI auto-fix is strictly opt-in and the API key is never written to
+disk unless you also supply it for the trading bot itself.
 
 ## Run
 
