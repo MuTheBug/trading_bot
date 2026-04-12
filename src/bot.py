@@ -92,6 +92,12 @@ class TradingBot:
         await self.exchange.connect()
         await self.telegram.start()
 
+        # Clear auto-pause from previous session on fresh restart
+        if self.state.state.paused:
+            logger.info("Clearing paused state from previous session")
+            self.state.state.paused = False
+            self.state.save()
+
         equity = await self.get_equity()
         if self.state.state.peak_equity < equity:
             self.state.state.peak_equity = equity
@@ -185,7 +191,8 @@ class TradingBot:
             logger.debug("Tick #{}", self._ticks_since_start)
 
             if self.state.state.paused:
-                logger.debug("Bot is paused, skipping tick")
+                if self._ticks_since_start <= 1:
+                    logger.warning("Bot is PAUSED (from previous session). Use /resume to unpause.")
                 return
 
             # If no active grid, try to set one up
