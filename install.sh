@@ -210,11 +210,15 @@ PYEOF
 }
 
 # Pull an embedded JSON object out of a text blob (tolerates prose around it).
-# Stdin: raw text. Stdout: extracted JSON object. Returns non-zero on failure.
+# Usage: _extract_json_obj "$text_var"
+# Stdout: extracted JSON object. Returns non-zero on failure.
 _extract_json_obj() {
-    python3 - <<'PYEOF'
-import json, sys
-text = sys.stdin.read().strip()
+    _EXTRACT_INPUT="$1" python3 - <<'PYEOF'
+import json, os, sys
+text = os.environ.get("_EXTRACT_INPUT", "").strip()
+if not text:
+    print("ERR: empty input to _extract_json_obj", file=sys.stderr)
+    sys.exit(1)
 i, j = text.find("{"), text.rfind("}")
 if i != -1 and j != -1 and j > i:
     text = text[i:j+1]
@@ -222,6 +226,7 @@ try:
     obj = json.loads(text)
 except Exception as e:
     print(f"ERR: not valid JSON: {e}", file=sys.stderr)
+    print(f"  input (first 300 chars): {text[:300]}", file=sys.stderr)
     sys.exit(1)
 if not isinstance(obj, dict):
     print("ERR: extracted value is not a JSON object", file=sys.stderr)
@@ -423,7 +428,7 @@ PYEOF
     fi
 
     local plan
-    if ! plan=$(printf '%s' "$text" | _extract_json_obj); then
+    if ! plan=$(_extract_json_obj "$text"); then
         warn "Preflight response was not valid JSON — continuing"
         return 0
     fi
@@ -545,7 +550,7 @@ PYEOF
     if ! text=$(_minimax_call "$payload"); then
         return 1
     fi
-    printf '%s' "$text" | _extract_json_obj
+    _extract_json_obj "$text"
 }
 
 run_with_ai_fix() {
