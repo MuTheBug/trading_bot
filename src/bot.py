@@ -98,6 +98,13 @@ class TradingBot:
             self.state.state.paused = False
             self.state.save()
 
+        # Clear stale grid from previous session — orders are gone after restart
+        if self.state.state.grid.active:
+            logger.info("Clearing stale grid from previous session (orders no longer exist)")
+            self.state.state.grid.active = False
+            self.state.state.grid.levels.clear()
+            self.state.save()
+
         equity = await self.get_equity()
         if self.state.state.peak_equity < equity:
             self.state.state.peak_equity = equity
@@ -188,11 +195,10 @@ class TradingBot:
         async with self._lock:
             self.state.roll_daily_if_needed()
             self._ticks_since_start += 1
-            logger.debug("Tick #{}", self._ticks_since_start)
+            logger.info("Tick #{}", self._ticks_since_start)
 
             if self.state.state.paused:
-                if self._ticks_since_start <= 1:
-                    logger.warning("Bot is PAUSED (from previous session). Use /resume to unpause.")
+                logger.warning("Bot is PAUSED. Use /resume to unpause.")
                 return
 
             # If no active grid, try to set one up
@@ -206,7 +212,11 @@ class TradingBot:
 
             # Get current mark price
             mark_price = await self.exchange.get_mark_price(symbol)
-            logger.debug("Tick #{} {} mark={:.8f}", self._ticks_since_start, symbol, mark_price)
+            logger.info("Tick #{} | {} | mark={:.6f} | buys={} sells={} | trips={} | profit={:.6f}",
+                        self._ticks_since_start, symbol, mark_price,
+                        sum(1 for lv in gs.levels if lv.buy_order_id),
+                        sum(1 for lv in gs.levels if lv.sell_order_id),
+                        gs.round_trips, gs.total_profit)
 
             # Update peak equity
             equity = await self.get_equity()
