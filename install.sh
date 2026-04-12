@@ -175,10 +175,33 @@ if isinstance(obj, dict) and obj.get("type") == "error":
 if "error" in obj and "content" not in obj:
     print(f"ERR: API error: {obj['error']}", file=sys.stderr)
     sys.exit(1)
+# Some API proxies wrap the content in "choices" (OpenAI-style) instead of
+# "content" (Anthropic-style). Handle both.
+content = obj.get("content") or []
+if not content and "choices" in obj:
+    for ch in obj.get("choices", []):
+        msg = ch.get("message", {})
+        if msg.get("content"):
+            sys.stdout.write(msg["content"])
+            sys.exit(0)
 text = ""
-for b in obj.get("content", []) or []:
+for b in content:
     if isinstance(b, dict) and b.get("type") == "text":
         text += b.get("text", "") or ""
+    elif isinstance(b, str):
+        text += b
+if not text.strip():
+    # Dump the response keys so the user can report the real structure.
+    keys = list(obj.keys()) if isinstance(obj, dict) else str(type(obj))
+    content_types = [
+        b.get("type", "?") if isinstance(b, dict) else type(b).__name__
+        for b in content
+    ] if content else []
+    print(f"ERR: API returned 200 but assistant text was empty", file=sys.stderr)
+    print(f"  response keys: {keys}", file=sys.stderr)
+    print(f"  content block types: {content_types}", file=sys.stderr)
+    print(f"  raw (first 500 chars): {raw[:500]}", file=sys.stderr)
+    sys.exit(1)
 sys.stdout.write(text)
 PYEOF
     local rc=$?
