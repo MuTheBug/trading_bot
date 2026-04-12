@@ -96,13 +96,18 @@ class GridManager:
         qty = round_qty(params.qty_per_grid, step)
 
         if qty < filters.min_qty:
-            logger.error(
-                "Grid qty {:.8f} below min_qty {:.8f}", qty, filters.min_qty
-            )
-            return False
+            qty = filters.min_qty
 
-        # Check min notional
+        # Auto-bump qty to meet min notional at the lowest grid price
         min_price = min(prices)
+        if min_price > 0 and min_price * qty < filters.min_notional:
+            needed = math.ceil(filters.min_notional / min_price / step) * step
+            if needed >= filters.min_qty:
+                qty = needed
+                logger.info(
+                    "Bumped qty_per_grid to {:.8f} to meet min_notional", qty,
+                )
+
         if min_price * qty < filters.min_notional:
             logger.error(
                 "Grid notional {:.4f} below min_notional {:.4f}",

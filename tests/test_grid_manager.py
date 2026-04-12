@@ -139,7 +139,7 @@ async def test_grid_setup_creates_orders():
 
 
 @pytest.mark.asyncio
-async def test_grid_setup_rejects_below_min_qty():
+async def test_grid_setup_auto_bumps_below_min_qty():
     sim = FakeSim(price=0.15)
     await sim.connect()
     store = StateStore("/tmp/test_grid_state2.json")
@@ -148,24 +148,26 @@ async def test_grid_setup_rejects_below_min_qty():
 
     params = _make_params(qty_per_grid=0.5)  # below min_qty of 1.0
     ok = await gm.setup_grid(params, filters, current_price=0.15)
-    assert not ok
+    assert ok  # auto-bumped to meet min_qty and min_notional
+    assert gm.grid.qty_per_grid >= filters.min_qty
 
 
 @pytest.mark.asyncio
-async def test_grid_setup_rejects_below_min_notional():
+async def test_grid_setup_auto_bumps_below_min_notional():
     sim = FakeSim(price=0.001)
     await sim.connect()
     store = StateStore("/tmp/test_grid_state3.json")
     gm = GridManager(sim, store)
     filters = _make_filters()
 
-    # price 0.001 * qty 1 = 0.001 < min_notional 5.0
+    # price 0.001 * qty 1 = 0.001 < min_notional 5.0, auto-bumped
     params = _make_params(
         lower_price=0.0009, upper_price=0.0011,
         qty_per_grid=1.0,
     )
     ok = await gm.setup_grid(params, filters, current_price=0.001)
-    assert not ok
+    assert ok
+    assert gm.grid.qty_per_grid * 0.0009 >= filters.min_notional
 
 
 # ---- Fill detection and counter orders ----

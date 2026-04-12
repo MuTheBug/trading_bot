@@ -357,15 +357,21 @@ class AIGridStrategy:
                           d.leverage, self.ai.max_leverage)
             return False
         if d.qty_per_grid < filters.min_qty:
-            logger.warning("AI grid: qty {} below min_qty {}", d.qty_per_grid, filters.min_qty)
-            return False
+            d.qty_per_grid = filters.min_qty
+        # Auto-bump qty to meet min notional at the lowest grid price
+        if d.lower_price > 0 and d.lower_price * d.qty_per_grid < filters.min_notional:
+            import math
+            needed = math.ceil(filters.min_notional / d.lower_price / filters.qty_step) * filters.qty_step
+            if needed >= filters.min_qty:
+                d.qty_per_grid = needed
+                logger.info("Auto-bumped qty_per_grid to {} to meet min_notional", needed)
         # Check that the grid range contains the current price
         if current_price < d.lower_price or current_price > d.upper_price:
             logger.warning("AI grid: current price {} outside grid [{}, {}]",
                           current_price, d.lower_price, d.upper_price)
             return False
-        # Check min notional at lowest price
-        if d.lower_price * d.qty_per_grid < filters.min_notional * 0.9:
+        # Final check min notional at lowest price
+        if d.lower_price * d.qty_per_grid < filters.min_notional:
             logger.warning("AI grid: notional at lower bound too small")
             return False
         # Check total margin doesn't exceed balance
