@@ -144,10 +144,6 @@ class TradingBot:
     async def run(self) -> None:
         await self.start()
         try:
-            # If no active grid, scan and set up
-            if not self.grid_manager.active:
-                await self._scan_and_setup_grid()
-
             while self._running:
                 try:
                     await self._tick()
@@ -186,12 +182,15 @@ class TradingBot:
         async with self._lock:
             self.state.roll_daily_if_needed()
             self._ticks_since_start += 1
+            logger.debug("Tick #{}", self._ticks_since_start)
 
             if self.state.state.paused:
+                logger.debug("Bot is paused, skipping tick")
                 return
 
             # If no active grid, try to set one up
             if not self.grid_manager.active:
+                logger.info("No active grid, scanning for setup...")
                 await self._scan_and_setup_grid()
                 return
 
@@ -200,6 +199,7 @@ class TradingBot:
 
             # Get current mark price
             mark_price = await self.exchange.get_mark_price(symbol)
+            logger.debug("Tick #{} {} mark={:.8f}", self._ticks_since_start, symbol, mark_price)
 
             # Update peak equity
             equity = await self.get_equity()
@@ -258,13 +258,17 @@ class TradingBot:
 
         try:
             # 1. Fetch all tickers and filters
+            logger.info("Fetching all tickers...")
             tickers = await self.exchange.get_all_tickers()
+            logger.info("Fetching all symbol filters...")
             all_filters = await self.exchange.get_all_symbol_filters()
             balance = await self.exchange.get_balance()
 
-            logger.info("Found {} USDT tickers, {} filters", len(tickers), len(all_filters))
+            logger.info("Found {} USDT tickers, {} filters, balance={:.4f}",
+                        len(tickers), len(all_filters), balance)
 
             # 2. AI picks the best symbol
+            logger.info("Asking AI to select best symbol...")
             choice = await self.ai_strategy.select_symbol(tickers, all_filters)
             if choice is None:
                 logger.error("AI could not select a symbol")
@@ -300,6 +304,7 @@ class TradingBot:
                 logger.warning("Could not fetch klines for {}: {}", choice.symbol, e)
 
             # 4. AI decides grid parameters
+            logger.info("Asking AI for grid parameters on {}...", choice.symbol)
             decision = await self.ai_strategy.decide_grid_params(
                 symbol=choice.symbol,
                 current_price=mark_price,
