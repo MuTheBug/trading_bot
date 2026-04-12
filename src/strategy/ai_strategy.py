@@ -1,27 +1,27 @@
-"""AI-driven grid strategy.
+"""AI-assisted grid strategy with mathematical profit guarantees.
 
-The AI (MiniMax-M2.7 via Anthropic-compatible API) performs two jobs:
+The strategy enforces hard mathematical constraints so every round-trip is
+profitable after fees. The AI only picks the symbol — all grid parameters
+are computed from market data and account constraints.
 
-1. **Symbol selection** — scans all Binance USDT-M perpetual tickers, picks
-   the best symbol for grid trading based on volatility, volume, and price
-   range.
+Profit guarantee per round-trip:
+    profit = spacing * qty - 2 * maker_fee * price * qty
+    We enforce spacing >= price * fee_mult * maker_fee
+    where fee_mult >= 6 (default 8), so each trip nets >= 6x the fee cost.
 
-2. **Grid parameter decision** — given the chosen symbol's recent price data,
-   the AI decides upper/lower bounds, number of grid levels, leverage, and
-   qty per grid, respecting the $10 account size and Binance minimum notional
-   constraints.
-
-3. **Rebalance evaluation** — when the current price moves out of the grid
-   range, the AI is asked whether to tear down and rebuild with new params
-   or to hold.
+Symbol selection scoring (computed, not AI-guessed):
+    score = (range_pct / max(abs(change_pct), 0.5)) * log10(volume_24h)
+    High score = oscillating (high range, low net change) + liquid.
+    Trending symbols get penalized by the change_pct denominator.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -35,115 +35,33 @@ except ImportError:  # pragma: no cover
 
 from ..config import AIConfig, GridConfig
 from ..exchange.base import TickerInfo, SymbolFilters
-from ..grid.manager import GridSetupParams
+from ..grid.manager import GridSetupParams, round_price, round_qty
 
 
-# ---- system prompts ----
+# Maker fee on Binance Futures (0.02%)
+MAKER_FEE = 0.0002
+
+# Minimum spacing multiplier over fees — each round trip must net at least
+# this many times the fee cost. 8x means spacing = 8 * 2 * fee * price,
+# so profit per trip = (8-2)/8 * spacing * qty = 75% of gross.
+MIN_FEE_MULT = 8
+
 
 SYMBOL_SCAN_PROMPT = """\
 You are the brain of an autonomous Binance USDT-M Futures grid trading bot.
 
-Your task: pick THE SINGLE BEST symbol for a neutral grid strategy right now.
+Pick THE SINGLE BEST symbol from this pre-scored list for grid trading.
+The "score" already ranks symbols by grid-friendliness (oscillation vs trend, \
+volume, range). Higher score = better for grids.
 
-A neutral grid places BUY limit orders below the current price and SELL limit \
-orders above. Profit comes from price oscillating within the grid range. The \
-ideal symbol has:
-- HIGH 24h volume (>50M USDT preferred) for fills
-- MODERATE volatility — price oscillates within a range, not trending hard
-- Price and filters that work with a $10 account (min notional ~5 USDT)
+Consider:
+- Prefer score > 15, but also consider practical factors
+- Avoid symbols with extreme recent pumps/dumps (high |change_24h|)
+- Prefer symbols where min_notional works with a $10 account
+- Prefer symbols you recognize as typically range-bound
 
-You will receive a JSON list of the top symbols by volume with their 24h stats.
-
-Reply with a SINGLE JSON object and nothing else:
-{
-  "symbol": "<SYMBOL>",
-  "reasoning": "<one sentence why this symbol is best for grid trading right now>"
-}
-"""
-
-GRID_PARAMS_PROMPT = """\
-You are the brain of an autonomous Binance USDT-M Futures grid trading bot.
-
-Your task: decide the grid parameters for {symbol}.
-
-Account context:
-- Available balance: {balance:.4f} USDT
-- Maximum leverage allowed: {max_leverage}x
-- With leverage, max notional = balance * leverage
-- Each grid level needs qty * price >= min_notional ({min_notional} USDT)
-- Minimum order qty: {min_qty}, qty step: {qty_step}, price tick: {price_tick}
-- Grid levels allowed: {min_grids} to {max_grids}
-
-Current market data:
-- Current price: {current_price}
-- 24h high: {high_24h}
-- 24h low: {low_24h}
-- 24h volume: {volume_24h:.0f} USDT
-- 24h change: {change_pct:.2f}%
-
-Recent 15m OHLCV (last {n_candles} candles):
-{klines_json}
-
-IMPORTANT constraints for a $10 account:
-- Total margin used = num_grids * qty_per_grid * avg_price / leverage
-- This total margin MUST be <= {balance:.4f} USDT (your available balance)
-- Each grid level: qty_per_grid * grid_price >= {min_notional} USDT
-- Choose leverage wisely: higher leverage = more grid levels possible but more \
-risk. For a $10 account, 5-10x leverage is typical.
-- qty_per_grid must be a multiple of {qty_step} and >= {min_qty}
-- Prices must be multiples of {price_tick}
-- Grid range should capture the likely oscillation range (often 1-3% for \
-15m-1h timeframes on crypto)
-
-Reply with a SINGLE JSON object and nothing else:
-{{
-  "upper_price": <float>,
-  "lower_price": <float>,
-  "num_grids": <int {min_grids}-{max_grids}>,
-  "leverage": <int 1-{max_leverage}>,
-  "qty_per_grid": <float>,
-  "reasoning": "<one sentence explaining your grid setup>"
-}}
-"""
-
-REBALANCE_PROMPT = """\
-You are the brain of an autonomous Binance USDT-M Futures grid trading bot.
-
-The current grid on {symbol} may need rebalancing. Price has moved {direction} \
-of the grid range.
-
-Current grid:
-- Range: {lower_price} - {upper_price}
-- Levels: {num_grids}, Spacing: {spacing:.8f}
-- Leverage: {leverage}x, Qty/grid: {qty_per_grid}
-- Realized profit: {total_profit:.6f} USDT
-- Round trips: {round_trips}
-- Net position qty: {net_qty:+.8f}
-- Unrealized PnL: {unrealized_pnl:+.6f} USDT
-
-Current price: {current_price}
-Balance: {balance:.4f} USDT
-
-Should we:
-1. "REBALANCE" — tear down and set up a new grid around the current price
-2. "HOLD" — keep the current grid (price might return to range)
-
-Reply with a SINGLE JSON object:
-{{
-  "action": "REBALANCE" | "HOLD",
-  "reasoning": "<one sentence>",
-  "new_upper": <float or null>,
-  "new_lower": <float or null>,
-  "new_num_grids": <int or null>,
-  "new_leverage": <int or null>,
-  "new_qty_per_grid": <float or null>
-}}
-
-If action is HOLD, set all new_* fields to null.
-If action is REBALANCE, provide new grid parameters following the same \
-constraints as initial setup. Balance={balance:.4f}, min_notional={min_notional}, \
-min_qty={min_qty}, qty_step={qty_step}, price_tick={price_tick}, \
-max_leverage={max_leverage}.
+Reply with ONLY a JSON object:
+{"symbol": "<SYMBOL>", "reasoning": "<one sentence>"}
 """
 
 
@@ -151,6 +69,7 @@ max_leverage={max_leverage}.
 class SymbolChoice:
     symbol: str
     reasoning: str
+    score: float
 
 
 @dataclass
@@ -160,6 +79,8 @@ class GridDecision:
     num_grids: int
     leverage: int
     qty_per_grid: float
+    spacing: float
+    profit_per_trip: float
     reasoning: str
 
 
@@ -170,8 +91,163 @@ class RebalanceDecision:
     new_params: Optional[GridSetupParams] = None
 
 
+def score_symbol(t: TickerInfo) -> float:
+    """Score a symbol for grid-friendliness.
+
+    High score = high oscillation (range), low trend (net change), high volume.
+    """
+    if t.price <= 0 or t.volume_24h <= 0:
+        return 0.0
+    range_pct = (t.high_24h - t.low_24h) / t.price * 100.0
+    abs_change = max(abs(t.change_pct_24h), 0.5)  # floor to avoid div-by-zero
+    # Oscillation ratio: high range + low net move = good
+    osc_ratio = range_pct / abs_change
+    # Volume factor: log scale so 100M and 1B aren't worlds apart
+    vol_factor = math.log10(max(t.volume_24h, 1))
+    return osc_ratio * vol_factor
+
+
+def compute_grid_params(
+    price: float,
+    ticker: TickerInfo,
+    filters: SymbolFilters,
+    balance: float,
+    max_leverage: int,
+    max_grids: int,
+    min_grids: int,
+) -> Optional[GridDecision]:
+    """Compute grid parameters mathematically — no AI involved.
+
+    The grid is centered on the current price. Width is based on
+    recent 24h range (use ~60% of it to stay safely inside).
+    Spacing is set to guarantee profit after fees.
+    """
+    if price <= 0 or balance <= 0:
+        return None
+
+    tick = filters.price_tick
+    step = filters.qty_step
+
+    # --- 1. Compute minimum profitable spacing ---
+    # Each round trip costs 2 * maker_fee * price * qty in fees.
+    # Spacing must be at least MIN_FEE_MULT * 2 * maker_fee * price
+    # so profit = (spacing - 2*fee*price) * qty > 0 with good margin.
+    min_spacing = price * 2 * MAKER_FEE * MIN_FEE_MULT
+    min_spacing = max(min_spacing, tick * 2)  # at least 2 ticks
+
+    # --- 2. Compute grid range from 24h volatility ---
+    range_24h = ticker.high_24h - ticker.low_24h
+    if range_24h <= 0:
+        range_24h = price * 0.02  # fallback: 2%
+
+    # Use 50% of 24h range as the grid width — conservative, keeps price
+    # inside the grid most of the time
+    grid_width = range_24h * 0.50
+    grid_width = max(grid_width, min_spacing * min_grids)  # at least min_grids spacings
+
+    # --- 3. Compute number of grids ---
+    num_grids = int(grid_width / min_spacing)
+    num_grids = max(min_grids, min(num_grids, max_grids))
+
+    # Recalculate actual spacing
+    spacing = grid_width / num_grids
+    # Ensure spacing is still profitable after rounding
+    if spacing < min_spacing:
+        spacing = min_spacing
+        grid_width = spacing * num_grids
+
+    # Round spacing to tick
+    spacing = round_price(spacing, tick)
+    if spacing < tick:
+        spacing = tick
+
+    # --- 4. Compute grid bounds centered on price ---
+    half_width = (spacing * num_grids) / 2
+    lower_price = round_price(price - half_width, tick)
+    upper_price = round_price(price + half_width, tick)
+
+    if lower_price <= 0:
+        lower_price = tick
+        upper_price = round_price(lower_price + spacing * num_grids, tick)
+
+    # --- 5. Compute qty and leverage ---
+    # Start with moderate leverage, increase only if needed for min_notional
+    for leverage in [5, 8, 10, 15, max_leverage]:
+        if leverage > max_leverage:
+            leverage = max_leverage
+
+        # Max margin available
+        max_margin = balance * 0.85  # keep 15% reserve
+
+        # qty must satisfy: qty * lower_price >= min_notional
+        min_qty_for_notional = filters.min_notional / lower_price if lower_price > 0 else filters.min_qty
+        min_qty_for_notional = math.ceil(min_qty_for_notional / step) * step
+        qty = max(min_qty_for_notional, filters.min_qty)
+
+        # Total margin needed: num_grids * qty * avg_price / leverage
+        # (only ~half the grid has active orders at any time, but be conservative)
+        avg_price = (upper_price + lower_price) / 2
+        total_margin = num_grids * qty * avg_price / leverage
+
+        if total_margin <= max_margin:
+            break
+    else:
+        # Even max leverage can't fit — reduce grids
+        avg_price = (upper_price + lower_price) / 2
+        max_margin = balance * 0.85
+        leverage = max_leverage
+        min_qty_for_notional = filters.min_notional / lower_price if lower_price > 0 else filters.min_qty
+        qty = max(math.ceil(min_qty_for_notional / step) * step, filters.min_qty)
+        margin_per_grid = qty * avg_price / leverage
+        if margin_per_grid <= 0:
+            return None
+        num_grids = int(max_margin / margin_per_grid)
+        num_grids = max(min_grids, min(num_grids, max_grids))
+        grid_width = spacing * num_grids
+        half_width = grid_width / 2
+        lower_price = round_price(price - half_width, tick)
+        upper_price = round_price(price + half_width, tick)
+
+    qty = round_qty(qty, step)
+    if qty < filters.min_qty:
+        qty = filters.min_qty
+
+    # Final validation
+    if lower_price * qty < filters.min_notional:
+        return None
+    if upper_price <= lower_price:
+        return None
+    if num_grids < min_grids:
+        return None
+
+    # --- 6. Calculate expected profit per round trip ---
+    fee_per_trip = 2 * MAKER_FEE * price * qty
+    profit_per_trip = spacing * qty - fee_per_trip
+    if profit_per_trip <= 0:
+        return None
+
+    total_margin = num_grids * qty * avg_price / leverage
+    reasoning = (
+        f"Grid: {num_grids} levels, spacing {spacing:.6f} "
+        f"({spacing/price*100:.3f}%), "
+        f"profit/trip {profit_per_trip:.6f} USDT, "
+        f"leverage {leverage}x, margin {total_margin:.2f}/{balance:.2f} USDT"
+    )
+
+    return GridDecision(
+        upper_price=upper_price,
+        lower_price=lower_price,
+        num_grids=num_grids,
+        leverage=leverage,
+        qty_per_grid=qty,
+        spacing=spacing,
+        profit_per_trip=profit_per_trip,
+        reasoning=reasoning,
+    )
+
+
 class AIGridStrategy:
-    """AI-driven grid parameter selection."""
+    """Math-first grid strategy. AI only assists with symbol selection."""
 
     def __init__(
         self,
@@ -203,254 +279,164 @@ class AIGridStrategy:
     async def select_symbol(
         self, tickers: List[TickerInfo], all_filters: Dict[str, SymbolFilters],
     ) -> Optional[SymbolChoice]:
-        """Ask AI to pick the best symbol from the scanned tickers."""
-        # Pre-filter: only USDT perpetuals with decent volume
+        """Score all symbols mathematically, then let AI pick from the top candidates."""
+        # Pre-filter: USDT perpetuals with decent volume, tradeable
         candidates = [
             t for t in tickers
-            if t.volume_24h > 10_000_000
+            if t.volume_24h > 20_000_000
             and t.symbol in all_filters
             and t.price > 0
+            and t.symbol.endswith("USDT")
         ]
-        # Sort by volume descending, take top 30
-        candidates.sort(key=lambda t: t.volume_24h, reverse=True)
-        candidates = candidates[:30]
 
         if not candidates:
             logger.error("No viable symbols found after filtering")
             return None
 
-        # Build compact JSON for the AI
+        # Score each symbol
+        scored = [(t, score_symbol(t)) for t in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Take top 15 for AI to choose from
+        top = scored[:15]
+
+        # Log the scores
+        for t, s in top[:5]:
+            logger.info("  {} score={:.1f} range={:.2f}% chg={:.2f}% vol={:.0f}M",
+                        t.symbol, s,
+                        (t.high_24h - t.low_24h) / t.price * 100,
+                        t.change_pct_24h,
+                        t.volume_24h / 1e6)
+
+        # Build compact data for AI
         ticker_data = [
             {
                 "s": t.symbol,
-                "p": t.price,
-                "v24h": round(t.volume_24h),
-                "chg": round(t.change_pct_24h, 2),
-                "h": t.high_24h,
-                "l": t.low_24h,
-                "range_pct": round(
-                    (t.high_24h - t.low_24h) / t.price * 100, 2
-                ) if t.price > 0 else 0,
+                "price": t.price,
+                "score": round(s, 1),
+                "range_pct": round((t.high_24h - t.low_24h) / t.price * 100, 2),
+                "change_24h": round(t.change_pct_24h, 2),
+                "vol_M": round(t.volume_24h / 1e6),
                 "min_notional": all_filters[t.symbol].min_notional,
-                "min_qty": all_filters[t.symbol].min_qty,
             }
-            for t in candidates
+            for t, s in top
         ]
 
         prompt = json.dumps(ticker_data, separators=(",", ":"))
         raw = await self._call_ai(SYMBOL_SCAN_PROMPT, prompt)
+
+        # Fallback: if AI fails, just pick the highest-scored symbol
         if raw is None:
-            return None
+            best_t, best_s = top[0]
+            logger.warning("AI call failed, using top-scored symbol: {}", best_t.symbol)
+            return SymbolChoice(
+                symbol=best_t.symbol,
+                reasoning=f"Highest grid score ({best_s:.1f})",
+                score=best_s,
+            )
 
         obj = _extract_json(raw)
         if obj is None or "symbol" not in obj:
-            logger.warning("AI symbol selection response did not parse")
-            return None
+            best_t, best_s = top[0]
+            return SymbolChoice(
+                symbol=best_t.symbol,
+                reasoning=f"Highest grid score ({best_s:.1f})",
+                score=best_s,
+            )
 
         symbol = str(obj["symbol"]).upper()
-        # Validate the AI actually picked one of our candidates
-        valid_symbols = {t.symbol for t in candidates}
-        if symbol not in valid_symbols:
-            logger.warning("AI picked {} which is not in candidates", symbol)
-            return None
+        valid = {t.symbol: (t, s) for t, s in top}
+        if symbol not in valid:
+            best_t, best_s = top[0]
+            return SymbolChoice(
+                symbol=best_t.symbol,
+                reasoning=f"Highest grid score ({best_s:.1f})",
+                score=best_s,
+            )
 
+        t, s = valid[symbol]
         return SymbolChoice(
             symbol=symbol,
             reasoning=str(obj.get("reasoning", ""))[:240],
+            score=s,
         )
 
-    # ---- 2. Grid parameter decision ----
+    # ---- 2. Grid parameter computation (math, no AI) ----
 
-    async def decide_grid_params(
+    def compute_params(
         self,
         symbol: str,
         current_price: float,
         ticker: TickerInfo,
         filters: SymbolFilters,
         balance: float,
-        klines_15m: Optional[Any] = None,
     ) -> Optional[GridDecision]:
-        """Ask AI to decide grid parameters for the chosen symbol."""
-        # Build klines snippet
-        klines_json = "[]"
-        n_candles = 0
-        if klines_15m is not None and len(klines_15m) > 2:
-            n = min(self.ai.kline_history, len(klines_15m) - 1)
-            recent = klines_15m.iloc[-(n + 1):-1]
-            n_candles = len(recent)
-            rows = []
-            for _, r in recent.iterrows():
-                rows.append({
-                    "t": r.name.strftime("%H:%M") if hasattr(r.name, "strftime") else str(r.name),
-                    "o": round(float(r["open"]), 8),
-                    "h": round(float(r["high"]), 8),
-                    "l": round(float(r["low"]), 8),
-                    "c": round(float(r["close"]), 8),
-                    "v": round(float(r["volume"]), 2),
-                })
-            klines_json = json.dumps(rows, separators=(",", ":"))
-
-        prompt = GRID_PARAMS_PROMPT.format(
-            symbol=symbol,
+        """Compute grid parameters mathematically."""
+        return compute_grid_params(
+            price=current_price,
+            ticker=ticker,
+            filters=filters,
             balance=balance,
             max_leverage=self.ai.max_leverage,
-            min_notional=filters.min_notional,
-            min_qty=filters.min_qty,
-            qty_step=filters.qty_step,
-            price_tick=filters.price_tick,
-            min_grids=self.grid.min_grids,
             max_grids=self.grid.max_grids,
-            current_price=current_price,
-            high_24h=ticker.high_24h,
-            low_24h=ticker.low_24h,
-            volume_24h=ticker.volume_24h,
-            change_pct=ticker.change_pct_24h,
-            n_candles=n_candles,
-            klines_json=klines_json,
+            min_grids=self.grid.min_grids,
         )
 
-        raw = await self._call_ai(prompt, "Decide the grid parameters.")
-        if raw is None:
-            return None
+    # ---- 3. Rebalance (pure math — just re-center the grid) ----
 
-        obj = _extract_json(raw)
-        if obj is None:
-            logger.warning("AI grid params response did not parse")
-            return None
-
-        try:
-            decision = GridDecision(
-                upper_price=float(obj["upper_price"]),
-                lower_price=float(obj["lower_price"]),
-                num_grids=int(obj["num_grids"]),
-                leverage=int(obj["leverage"]),
-                qty_per_grid=float(obj["qty_per_grid"]),
-                reasoning=str(obj.get("reasoning", ""))[:240],
-            )
-        except (ValueError, TypeError, KeyError) as e:
-            logger.warning("AI grid params parse error: {}", e)
-            return None
-
-        # Validate
-        if not self._validate_grid_decision(decision, filters, balance, current_price):
-            return None
-
-        return decision
-
-    def _validate_grid_decision(
-        self,
-        d: GridDecision,
-        filters: SymbolFilters,
-        balance: float,
-        current_price: float,
-    ) -> bool:
-        """Structural validation of AI grid decision."""
-        if d.upper_price <= d.lower_price:
-            logger.warning("AI grid: upper <= lower ({} <= {})", d.upper_price, d.lower_price)
-            return False
-        if d.num_grids < self.grid.min_grids or d.num_grids > self.grid.max_grids:
-            logger.warning("AI grid: num_grids {} out of range [{}, {}]",
-                          d.num_grids, self.grid.min_grids, self.grid.max_grids)
-            return False
-        if d.leverage < 1 or d.leverage > self.ai.max_leverage:
-            logger.warning("AI grid: leverage {} out of range [1, {}]",
-                          d.leverage, self.ai.max_leverage)
-            return False
-        if d.qty_per_grid < filters.min_qty:
-            d.qty_per_grid = filters.min_qty
-        # Auto-bump qty to meet min notional at the lowest grid price
-        if d.lower_price > 0 and d.lower_price * d.qty_per_grid < filters.min_notional:
-            import math
-            needed = math.ceil(filters.min_notional / d.lower_price / filters.qty_step) * filters.qty_step
-            if needed >= filters.min_qty:
-                d.qty_per_grid = needed
-                logger.info("Auto-bumped qty_per_grid to {} to meet min_notional", needed)
-        # Check that the grid range contains the current price
-        if current_price < d.lower_price or current_price > d.upper_price:
-            logger.warning("AI grid: current price {} outside grid [{}, {}]",
-                          current_price, d.lower_price, d.upper_price)
-            return False
-        # Final check min notional at lowest price
-        if d.lower_price * d.qty_per_grid < filters.min_notional:
-            logger.warning("AI grid: notional at lower bound too small")
-            return False
-        # Check total margin doesn't exceed balance
-        avg_price = (d.upper_price + d.lower_price) / 2
-        total_margin = d.num_grids * d.qty_per_grid * avg_price / d.leverage
-        if total_margin > balance * 1.5:  # allow some slack
-            logger.warning("AI grid: total margin {:.4f} exceeds balance {:.4f}",
-                          total_margin, balance)
-            return False
-        return True
-
-    # ---- 3. Rebalance evaluation ----
-
-    async def evaluate_rebalance(
+    def compute_rebalance(
         self,
         symbol: str,
-        grid_summary: dict,
-        balance: float,
+        current_price: float,
+        ticker: TickerInfo,
         filters: SymbolFilters,
+        balance: float,
+        grid_summary: dict,
     ) -> RebalanceDecision:
-        """Ask AI whether to rebalance the grid."""
-        current_price = grid_summary["mark_price"]
-        direction = "above" if current_price > grid_summary["upper"] else "below"
-        spacing = grid_summary.get("spacing", 0)
+        """Decide whether to rebalance based on math, not AI.
 
-        prompt = REBALANCE_PROMPT.format(
-            symbol=symbol,
-            direction=direction,
-            lower_price=grid_summary["lower"],
-            upper_price=grid_summary["upper"],
-            num_grids=grid_summary["num_grids"],
-            spacing=spacing,
-            leverage=grid_summary["leverage"],
-            qty_per_grid=grid_summary["qty_per_grid"],
-            total_profit=grid_summary["total_profit"],
-            round_trips=grid_summary["round_trips"],
-            net_qty=grid_summary["net_qty"],
-            unrealized_pnl=grid_summary["unrealized_pnl"],
-            current_price=current_price,
+        Rebalance if price is out of range. Re-center the grid around
+        the current price with same mathematical constraints.
+        """
+        upper = grid_summary["upper"]
+        lower = grid_summary["lower"]
+        total_profit = grid_summary["total_profit"]
+        total_fees = grid_summary["total_fees"]
+        net_profit = total_profit - total_fees
+
+        # If we've made profit, always rebalance to lock it in and re-center
+        # If losing, rebalance to cut exposure
+        decision = compute_grid_params(
+            price=current_price,
+            ticker=ticker,
+            filters=filters,
             balance=balance,
-            min_notional=filters.min_notional,
-            min_qty=filters.min_qty,
-            qty_step=filters.qty_step,
-            price_tick=filters.price_tick,
             max_leverage=self.ai.max_leverage,
+            max_grids=self.grid.max_grids,
+            min_grids=self.grid.min_grids,
         )
 
-        raw = await self._call_ai(prompt, "Evaluate rebalance.")
-        if raw is None:
-            return RebalanceDecision(action="HOLD", reasoning="AI call failed")
+        if decision is None:
+            return RebalanceDecision(
+                action="HOLD",
+                reasoning="Cannot compute viable grid params at current price",
+            )
 
-        obj = _extract_json(raw)
-        if obj is None:
-            return RebalanceDecision(action="HOLD", reasoning="AI response did not parse")
+        new_params = GridSetupParams(
+            symbol=symbol,
+            upper_price=decision.upper_price,
+            lower_price=decision.lower_price,
+            num_grids=decision.num_grids,
+            leverage=decision.leverage,
+            qty_per_grid=decision.qty_per_grid,
+            reasoning=f"Re-centered grid. Previous net: {net_profit:+.6f} USDT. {decision.reasoning}",
+        )
 
-        action = str(obj.get("action", "HOLD")).upper()
-        reasoning = str(obj.get("reasoning", ""))[:240]
-
-        if action == "REBALANCE":
-            try:
-                new_params = GridSetupParams(
-                    symbol=symbol,
-                    upper_price=float(obj["new_upper"]),
-                    lower_price=float(obj["new_lower"]),
-                    num_grids=int(obj["new_num_grids"]),
-                    leverage=int(obj["new_leverage"]),
-                    qty_per_grid=float(obj["new_qty_per_grid"]),
-                    reasoning=reasoning,
-                )
-                return RebalanceDecision(
-                    action="REBALANCE",
-                    reasoning=reasoning,
-                    new_params=new_params,
-                )
-            except (ValueError, TypeError, KeyError) as e:
-                logger.warning("AI rebalance params parse error: {}", e)
-                return RebalanceDecision(action="HOLD", reasoning=f"Parse error: {e}")
-
-        return RebalanceDecision(action="HOLD", reasoning=reasoning)
+        return RebalanceDecision(
+            action="REBALANCE",
+            reasoning=f"Re-centering around {current_price:.6f}. Net profit so far: {net_profit:+.6f}",
+            new_params=new_params,
+        )
 
     # ---- API call ----
 
@@ -501,7 +487,6 @@ class AIGridStrategy:
 # ---- helpers ----
 
 def _extract_text(msg: Any) -> str:
-    """Pull the first 'text' block out of an Anthropic Message, skipping thinking."""
     content = getattr(msg, "content", None) or []
     out_parts: List[str] = []
     for block in content:
@@ -515,7 +500,6 @@ _JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """Best-effort JSON extractor. Tolerates markdown fences and surrounding prose."""
     if not text:
         return None
     candidates: List[str] = []
@@ -538,4 +522,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-__all__ = ["AIGridStrategy", "SymbolChoice", "GridDecision", "RebalanceDecision"]
+__all__ = [
+    "AIGridStrategy", "SymbolChoice", "GridDecision", "RebalanceDecision",
+    "score_symbol", "compute_grid_params",
+]

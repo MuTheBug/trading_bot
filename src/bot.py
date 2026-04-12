@@ -269,7 +269,7 @@ class TradingBot:
                         await self._check_rebalance(mark_price)
 
     async def _scan_and_setup_grid(self) -> None:
-        """Scan symbols, let AI pick one, set up the grid."""
+        """Scan symbols, let AI pick one, compute grid params, set up the grid."""
         logger.info("Scanning symbols for grid trading...")
         await self.telegram.send("\U0001f50d Scanning symbols for grid trading...")
 
@@ -284,55 +284,45 @@ class TradingBot:
             logger.info("Found {} USDT tickers, {} filters, balance={:.4f}",
                         len(tickers), len(all_filters), balance)
 
-            # 2. AI picks the best symbol
-            logger.info("Asking AI to select best symbol...")
+            # 2. AI picks the best symbol (scoring is math-based, AI just confirms)
+            logger.info("Selecting best symbol for grid trading...")
             choice = await self.ai_strategy.select_symbol(tickers, all_filters)
             if choice is None:
-                logger.error("AI could not select a symbol")
-                await self.telegram.send("\u274c AI could not select a symbol. Will retry.")
+                logger.error("Could not select a symbol")
+                await self.telegram.send("\u274c Could not select a symbol. Will retry.")
                 return
 
-            logger.info("AI selected: {} ({})", choice.symbol, choice.reasoning)
+            logger.info("Selected: {} score={:.1f} ({})", choice.symbol, choice.score, choice.reasoning)
             await self.telegram.send(
-                f"\U0001f3af AI selected <b>{choice.symbol}</b>\n"
+                f"\U0001f3af Selected <b>{choice.symbol}</b> (score {choice.score:.1f})\n"
                 f"<i>{choice.reasoning}</i>"
             )
 
-            # 3. Get current price and klines for the chosen symbol
+            # 3. Get current price and filters for the chosen symbol
             mark_price = await self.exchange.get_mark_price(choice.symbol)
             filters = all_filters.get(choice.symbol)
             if filters is None:
                 filters = await self.exchange.get_symbol_filters(choice.symbol)
 
-            # Find the ticker info for this symbol
             ticker = next((t for t in tickers if t.symbol == choice.symbol), None)
             if ticker is None:
                 logger.error("Ticker for {} not found", choice.symbol)
                 return
 
-            # Fetch 15m klines for AI context
-            klines_15m = None
-            try:
-                klines_15m = await self.exchange.get_klines(
-                    choice.symbol, self.config.timeframe,
-                    limit=self.config.ai.kline_history + 5,
-                )
-            except Exception as e:
-                logger.warning("Could not fetch klines for {}: {}", choice.symbol, e)
-
-            # 4. AI decides grid parameters
-            logger.info("Asking AI for grid parameters on {}...", choice.symbol)
-            decision = await self.ai_strategy.decide_grid_params(
+            # 4. Compute grid parameters mathematically (no AI)
+            logger.info("Computing grid parameters for {}...", choice.symbol)
+            decision = self.ai_strategy.compute_params(
                 symbol=choice.symbol,
                 current_price=mark_price,
                 ticker=ticker,
                 filters=filters,
                 balance=balance,
-                klines_15m=klines_15m,
             )
             if decision is None:
-                logger.error("AI could not decide grid parameters")
-                await self.telegram.send("\u274c AI could not decide grid parameters. Will retry.")
+                logger.error("Cannot compute viable grid parameters for {}", choice.symbol)
+                await self.telegram.send(
+                    f"\u274c Cannot compute viable grid for {choice.symbol}. Will retry."
+                )
                 return
 
             # 5. Set up the grid
@@ -348,12 +338,12 @@ class TradingBot:
 
             success = await self.grid_manager.setup_grid(params, filters, mark_price)
             if success:
-                spacing = (decision.upper_price - decision.lower_price) / decision.num_grids
                 await self.telegram.send(
                     f"\u2705 <b>Grid active</b> on {choice.symbol}\n"
                     f"Range: {decision.lower_price:.8f} - {decision.upper_price:.8f}\n"
-                    f"Levels: {decision.num_grids} | Spacing: {spacing:.8f}\n"
+                    f"Levels: {decision.num_grids} | Spacing: {decision.spacing:.8f}\n"
                     f"Leverage: {decision.leverage}x | Qty: {decision.qty_per_grid:.8f}\n"
+                    f"Profit/trip: {decision.profit_per_trip:.6f} USDT\n"
                     f"<i>{decision.reasoning}</i>"
                 )
                 self._last_rebalance_check = datetime.now(timezone.utc)
@@ -369,18 +359,27 @@ class TradingBot:
             )
 
     async def _check_rebalance(self, mark_price: float) -> None:
-        """Ask AI whether to rebalance the grid."""
+        """Check whether to rebalance the grid (pure math, no AI)."""
         gs = self.grid_manager.grid
         symbol = gs.symbol
         balance = await self.exchange.get_balance()
         filters = await self.exchange.get_symbol_filters(symbol)
 
+        # Need ticker data for the rebalance computation
+        tickers = await self.exchange.get_all_tickers()
+        ticker = next((t for t in tickers if t.symbol == symbol), None)
+        if ticker is None:
+            logger.warning("Cannot get ticker for {} — skipping rebalance", symbol)
+            return
+
         summary = self.grid_manager.grid_summary(mark_price)
-        decision = await self.ai_strategy.evaluate_rebalance(
+        decision = self.ai_strategy.compute_rebalance(
             symbol=symbol,
-            grid_summary=summary,
-            balance=balance,
+            current_price=mark_price,
+            ticker=ticker,
             filters=filters,
+            balance=balance,
+            grid_summary=summary,
         )
 
         logger.info("Rebalance decision: {} ({})", decision.action, decision.reasoning)
@@ -390,10 +389,8 @@ class TradingBot:
                 f"\U0001f504 <b>Rebalancing grid</b> on {symbol}\n"
                 f"<i>{decision.reasoning}</i>"
             )
-            # Tear down old grid
             await self.grid_manager.teardown()
 
-            # Set up new grid
             success = await self.grid_manager.setup_grid(
                 decision.new_params, filters, mark_price
             )
@@ -412,7 +409,7 @@ class TradingBot:
                 )
             self._last_rebalance_check = datetime.now(timezone.utc)
         else:
-            logger.info("AI says HOLD: {}", decision.reasoning)
+            logger.info("Holding grid: {}", decision.reasoning)
 
     def build_daily_summary(self) -> str:
         """Build daily summary text for Telegram / logging."""

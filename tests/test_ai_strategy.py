@@ -1,5 +1,5 @@
-"""AI grid strategy tests — exercise parsing, symbol selection, and grid param
-decisions with a stubbed Anthropic client so no network calls happen.
+"""AI grid strategy tests — symbol selection, math-based grid params,
+rebalance, and JSON parsing helpers. Stubbed Anthropic client for no network.
 """
 import json
 from types import SimpleNamespace
@@ -8,7 +8,10 @@ import pytest
 
 from src.config import AIConfig, GridConfig
 from src.exchange.base import SymbolFilters, TickerInfo
-from src.strategy.ai_strategy import AIGridStrategy, _extract_json
+from src.strategy.ai_strategy import (
+    AIGridStrategy, _extract_json, score_symbol, compute_grid_params,
+    MAKER_FEE, MIN_FEE_MULT,
+)
 
 
 class _StubMessages:
@@ -84,6 +87,26 @@ def test_extract_json_garbage():
     assert _extract_json("not json at all") is None
 
 
+# ---- Symbol scoring ----
+
+def test_score_symbol_oscillating_beats_trending():
+    # High range, low net change -> high score (oscillating)
+    oscillating = TickerInfo("A", 1.0, 100_000_000, 0.5, 1.05, 0.95)
+    # High range, high net change -> lower score (trending)
+    trending = TickerInfo("B", 1.0, 100_000_000, 8.0, 1.10, 1.00)
+    assert score_symbol(oscillating) > score_symbol(trending)
+
+
+def test_score_symbol_zero_volume():
+    t = TickerInfo("X", 1.0, 0, 1.0, 1.01, 0.99)
+    assert score_symbol(t) == 0.0
+
+
+def test_score_symbol_zero_price():
+    t = TickerInfo("X", 0.0, 1e6, 1.0, 0.01, 0.0)
+    assert score_symbol(t) == 0.0
+
+
 # ---- Symbol selection ----
 
 @pytest.mark.asyncio
@@ -96,43 +119,39 @@ async def test_select_symbol_happy_path():
     choice = await s.select_symbol(_make_tickers(), _make_filters())
     assert choice is not None
     assert choice.symbol == "DOGEUSDT"
-    assert "volume" in choice.reasoning.lower() or len(choice.reasoning) > 0
+    assert choice.score > 0
 
 
 @pytest.mark.asyncio
-async def test_select_symbol_invalid_pick():
+async def test_select_symbol_invalid_pick_falls_back():
+    """AI picks a symbol not in the top list — fallback to highest score."""
     reply = json.dumps({
         "symbol": "INVALIDUSDT",
         "reasoning": "this does not exist",
     })
     s = _strategy_with_reply(reply)
     choice = await s.select_symbol(_make_tickers(), _make_filters())
-    assert choice is None
+    # Falls back to highest-scored symbol instead of None
+    assert choice is not None
+    assert choice.score > 0
 
 
 @pytest.mark.asyncio
-async def test_select_symbol_bad_json():
+async def test_select_symbol_bad_json_falls_back():
+    """AI returns garbage — fallback to highest-scored symbol."""
     s = _strategy_with_reply("sorry, can't help")
     choice = await s.select_symbol(_make_tickers(), _make_filters())
-    assert choice is None
+    assert choice is not None
+    assert choice.score > 0
 
 
-# ---- Grid parameter decisions ----
+# ---- Math-based grid parameter computation ----
 
-@pytest.mark.asyncio
-async def test_decide_grid_params_happy_path():
-    reply = json.dumps({
-        "upper_price": 0.155,
-        "lower_price": 0.145,
-        "num_grids": 5,
-        "leverage": 10,
-        "qty_per_grid": 50.0,
-        "reasoning": "tight range around current price",
-    })
-    s = _strategy_with_reply(reply)
-    ticker = _make_tickers()[0]  # DOGEUSDT
+def test_compute_params_happy_path():
+    s = _strategy_with_reply("")
+    ticker = _make_tickers()[0]  # DOGEUSDT price=0.15
     filters = _make_filters()["DOGEUSDT"]
-    decision = await s.decide_grid_params(
+    decision = s.compute_params(
         symbol="DOGEUSDT",
         current_price=0.15,
         ticker=ticker,
@@ -140,103 +159,105 @@ async def test_decide_grid_params_happy_path():
         balance=10.0,
     )
     assert decision is not None
-    assert decision.upper_price == 0.155
-    assert decision.lower_price == 0.145
-    assert decision.num_grids == 5
-    assert decision.leverage == 10
+    assert decision.lower_price < 0.15 < decision.upper_price
+    assert decision.num_grids >= 3
+    assert decision.spacing > 0
+    assert decision.profit_per_trip > 0
+    assert decision.leverage >= 5
 
 
-@pytest.mark.asyncio
-async def test_decide_grid_params_price_outside_range():
-    reply = json.dumps({
-        "upper_price": 0.10,
-        "lower_price": 0.09,
-        "num_grids": 5,
-        "leverage": 10,
-        "qty_per_grid": 50.0,
-        "reasoning": "wrong range",
-    })
-    s = _strategy_with_reply(reply)
+def test_compute_params_profit_guaranteed():
+    """Each round trip must be profitable after fees."""
+    s = _strategy_with_reply("")
     ticker = _make_tickers()[0]
     filters = _make_filters()["DOGEUSDT"]
-    decision = await s.decide_grid_params(
-        symbol="DOGEUSDT",
-        current_price=0.15,
-        ticker=ticker,
-        filters=filters,
-        balance=10.0,
-    )
-    assert decision is None  # current price outside range
+    decision = s.compute_params("DOGEUSDT", 0.15, ticker, filters, 10.0)
+    assert decision is not None
+    # Verify the math: spacing * qty > 2 * fee * price * qty
+    fee_cost = 2 * MAKER_FEE * 0.15 * decision.qty_per_grid
+    gross = decision.spacing * decision.qty_per_grid
+    assert gross > fee_cost
 
 
-@pytest.mark.asyncio
-async def test_decide_grid_params_too_many_grids():
-    reply = json.dumps({
-        "upper_price": 0.155,
-        "lower_price": 0.145,
-        "num_grids": 50,  # exceeds max_grids
-        "leverage": 10,
-        "qty_per_grid": 50.0,
-        "reasoning": "too many",
-    })
-    s = _strategy_with_reply(reply)
+def test_compute_params_zero_balance():
+    s = _strategy_with_reply("")
     ticker = _make_tickers()[0]
     filters = _make_filters()["DOGEUSDT"]
-    decision = await s.decide_grid_params(
-        symbol="DOGEUSDT",
-        current_price=0.15,
-        ticker=ticker,
-        filters=filters,
-        balance=10.0,
-    )
+    decision = s.compute_params("DOGEUSDT", 0.15, ticker, filters, 0.0)
     assert decision is None
 
 
-# ---- Rebalance evaluation ----
+def test_compute_params_zero_price():
+    s = _strategy_with_reply("")
+    ticker = _make_tickers()[0]
+    filters = _make_filters()["DOGEUSDT"]
+    decision = s.compute_params("DOGEUSDT", 0.0, ticker, filters, 10.0)
+    assert decision is None
 
-@pytest.mark.asyncio
-async def test_evaluate_rebalance_hold():
-    reply = json.dumps({
-        "action": "HOLD",
-        "reasoning": "price will return",
-        "new_upper": None,
-        "new_lower": None,
-        "new_num_grids": None,
-        "new_leverage": None,
-        "new_qty_per_grid": None,
-    })
-    s = _strategy_with_reply(reply)
+
+def test_compute_params_btc():
+    """BTC has high price — ensure grid still works with $10."""
+    s = _strategy_with_reply("")
+    ticker = _make_tickers()[1]  # BTCUSDT price=60000
+    filters = _make_filters()["BTCUSDT"]
+    decision = s.compute_params("BTCUSDT", 60000.0, ticker, filters, 10.0)
+    # May or may not be viable with $10 — just ensure no crash
+    if decision is not None:
+        assert decision.profit_per_trip > 0
+
+
+# ---- compute_grid_params standalone ----
+
+def test_compute_grid_params_min_spacing_respected():
+    """Spacing must be at least MIN_FEE_MULT * 2 * fee * price."""
+    ticker = TickerInfo("TEST", 100.0, 1e9, 1.0, 105.0, 95.0)
+    filters = SymbolFilters("TEST", 0.01, 0.01, 0.01, 5.0)
+    decision = compute_grid_params(100.0, ticker, filters, 100.0, 20, 15, 3)
+    assert decision is not None
+    min_spacing = 100.0 * 2 * MAKER_FEE * MIN_FEE_MULT
+    assert decision.spacing >= min_spacing * 0.99  # allow tiny float imprecision
+
+
+# ---- Rebalance (math-based) ----
+
+def test_compute_rebalance_returns_new_params():
+    s = _strategy_with_reply("")
+    ticker = _make_tickers()[0]
+    filters = _make_filters()["DOGEUSDT"]
     summary = {
         "symbol": "DOGEUSDT", "upper": 0.155, "lower": 0.145,
         "num_grids": 5, "spacing": 0.002, "leverage": 10,
-        "qty_per_grid": 50.0, "total_profit": 0.001, "round_trips": 3,
-        "net_qty": 50.0, "unrealized_pnl": -0.002, "mark_price": 0.157,
+        "qty_per_grid": 50.0, "total_profit": 0.001, "total_fees": 0.0002,
+        "round_trips": 3, "net_qty": 50.0, "unrealized_pnl": -0.002,
+        "mark_price": 0.16,
     }
-    filters = _make_filters()["DOGEUSDT"]
-    decision = await s.evaluate_rebalance("DOGEUSDT", summary, 10.0, filters)
-    assert decision.action == "HOLD"
-
-
-@pytest.mark.asyncio
-async def test_evaluate_rebalance_rebalance():
-    reply = json.dumps({
-        "action": "REBALANCE",
-        "reasoning": "price moved too far",
-        "new_upper": 0.165,
-        "new_lower": 0.155,
-        "new_num_grids": 5,
-        "new_leverage": 10,
-        "new_qty_per_grid": 50.0,
-    })
-    s = _strategy_with_reply(reply)
-    summary = {
-        "symbol": "DOGEUSDT", "upper": 0.155, "lower": 0.145,
-        "num_grids": 5, "spacing": 0.002, "leverage": 10,
-        "qty_per_grid": 50.0, "total_profit": 0.001, "round_trips": 3,
-        "net_qty": 50.0, "unrealized_pnl": -0.002, "mark_price": 0.16,
-    }
-    filters = _make_filters()["DOGEUSDT"]
-    decision = await s.evaluate_rebalance("DOGEUSDT", summary, 10.0, filters)
+    decision = s.compute_rebalance(
+        symbol="DOGEUSDT",
+        current_price=0.16,
+        ticker=ticker,
+        filters=filters,
+        balance=10.0,
+        grid_summary=summary,
+    )
     assert decision.action == "REBALANCE"
     assert decision.new_params is not None
-    assert decision.new_params.upper_price == 0.165
+    # New grid should be centered around current price
+    p = decision.new_params
+    assert p.lower_price < 0.16 < p.upper_price
+
+
+def test_compute_rebalance_hold_when_no_viable_params():
+    """If compute_grid_params returns None, decision should be HOLD."""
+    s = _strategy_with_reply("")
+    # Ticker with zero price — no viable grid
+    ticker = TickerInfo("BAD", 0.0, 1e6, 0.0, 0.0, 0.0)
+    filters = _make_filters()["DOGEUSDT"]
+    summary = {
+        "symbol": "BAD", "upper": 0.01, "lower": 0.005,
+        "num_grids": 3, "spacing": 0.001, "leverage": 5,
+        "qty_per_grid": 1.0, "total_profit": 0.0, "total_fees": 0.0,
+        "round_trips": 0, "net_qty": 0.0, "unrealized_pnl": 0.0,
+        "mark_price": 0.0,
+    }
+    decision = s.compute_rebalance("BAD", 0.0, ticker, filters, 10.0, summary)
+    assert decision.action == "HOLD"
