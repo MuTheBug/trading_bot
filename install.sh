@@ -232,11 +232,20 @@ try:
 except OSError:
     pass
 
-pkg_mgr = next(
-    (m for m in ("apt-get", "dnf", "yum", "apk", "pacman", "zypper", "brew")
-     if has(m)),
-    None,
-)
+# Termux detection (Android). Termux has its own filesystem under
+# /data/data/com.termux, no sudo, no /etc/os-release, and uses `pkg` (a
+# wrapper around apt against the Termux repo) as its package manager.
+termux_prefix = os.environ.get("PREFIX", "")
+is_termux = termux_prefix.startswith("/data/data/com.termux") or os.path.isdir("/data/data/com.termux/files/usr")
+
+if is_termux:
+    pkg_mgr = "pkg"
+else:
+    pkg_mgr = next(
+        (m for m in ("apt-get", "dnf", "yum", "apk", "pacman", "zypper", "brew", "pkg")
+         if has(m)),
+        None,
+    )
 
 venv_ok = False
 venv_err = None
@@ -254,10 +263,15 @@ except Exception as e:
 info = {
     "uname": platform.platform(),
     "arch": platform.machine(),
-    "distro": os_release.get("PRETTY_NAME") or os_release.get("NAME") or "unknown",
-    "distro_id": os_release.get("ID", "unknown"),
+    "distro": (
+        "Termux (Android)" if is_termux
+        else (os_release.get("PRETTY_NAME") or os_release.get("NAME") or "unknown")
+    ),
+    "distro_id": "termux" if is_termux else os_release.get("ID", "unknown"),
     "distro_id_like": os_release.get("ID_LIKE", ""),
     "version_id": os_release.get("VERSION_ID", ""),
+    "is_termux": is_termux,
+    "termux_prefix": termux_prefix,
     "python_version": platform.python_version(),
     "python_executable": shutil.which("python3") or "",
     "pip_version": run(["python3", "-m", "pip", "--version"]),
@@ -268,6 +282,7 @@ info = {
     "has_git": has("git"),
     "has_make": has("make"),
     "has_gcc": has("gcc"),
+    "has_clang": has("clang"),
     "has_gxx": has("g++"),
     "has_rustc": has("rustc"),
     "has_cargo": has("cargo"),
@@ -295,16 +310,20 @@ preflight_run() {
         return 0
     fi
 
-    # Show the scan summary to the user.
-    python3 - < "$info_file" <<'PYEOF'
-import json, sys
-d = json.load(sys.stdin)
+    # Show the scan summary to the user. Use an env var (not stdin) so the
+    # `python3 - <<'PYEOF'` heredoc isn't fighting a `< file` redirect for
+    # Python's stdin.
+    INFO_FILE="$info_file" python3 - <<'PYEOF'
+import json, os
+with open(os.environ["INFO_FILE"]) as f:
+    d = json.load(f)
 def tick(x): return "\u2713" if x else "\u2717"
 lines = [
     f"   distro:       {d.get('distro','?')}  [{d.get('distro_id','?')}]",
     f"   arch:         {d.get('arch','?')}",
     f"   python:       {d.get('python_version','?')}",
     f"   pkg manager:  {d.get('pkg_manager','?')}",
+    f"   termux:       {d.get('is_termux', False)}",
     f"   venv module:  {'OK' if d.get('has_python3_venv_module') else 'MISSING'}",
     f"   curl:  {tick(d.get('has_curl'))}   git: {tick(d.get('has_git'))}   sudo: {tick(d.get('has_sudo'))}",
     f"   gcc:   {tick(d.get('has_gcc'))}   make: {tick(d.get('has_make'))}   g++:  {tick(d.get('has_gxx'))}",
@@ -336,10 +355,18 @@ system = (
     "environment already looks ready, return setup_commands=[].\n\n"
     "Rules:\n"
     "- Use the exact package manager reported in `pkg_manager` (apt-get, "
-    "dnf, yum, apk, pacman, zypper, brew).\n"
-    "- Prefix with `sudo` unless `is_root` is true.\n"
+    "dnf, yum, apk, pacman, zypper, brew, pkg).\n"
+    "- If `is_termux` is true: this is Android Termux. Use `pkg install -y "
+    "<name>` (NOT apt-get), do NOT use sudo (Termux runs as the user, "
+    "there is no sudo and no root). Termux package names: `python` for "
+    "Python, `python-pip`, `clang` for the C compiler (gcc is aliased), "
+    "`make`, `binutils`, `libffi`, `openssl`, `rust` for rustc/cargo, "
+    "`pkg-config`. There is no python3-venv package — the venv module is "
+    "bundled with the `python` package on Termux. If venv is missing, "
+    "reinstall `python` via `pkg install -y python`.\n"
+    "- Otherwise: prefix commands with `sudo` unless `is_root` is true.\n"
     "- Non-interactive flags only: `apt-get -y`, `dnf -y`, "
-    "`apk add --no-cache`, `pacman --noconfirm -S`, etc.\n"
+    "`apk add --no-cache`, `pacman --noconfirm -S`, `pkg install -y`, etc.\n"
     "- Never suggest destructive commands: rm -rf /, mkfs, dd to a block "
     "device, shutdown, reboot, chmod 777 on system dirs, fork bombs, "
     "curl-pipe-sh from untrusted hosts.\n"
