@@ -22,10 +22,12 @@ except ImportError:  # pragma: no cover
 
 from .base import (
     ExchangeInterface,
+    LimitOrder,
     LivePosition,
     OrderResult,
     OrderSide,
     SymbolFilters,
+    TickerInfo,
 )
 
 
@@ -276,6 +278,134 @@ class BinanceLiveExchange(ExchangeInterface):
                 leverage=int(float(p.get("leverage", 1))),
             ))
         return out
+
+    # ---- limit order interface ----
+
+    async def limit_order(
+        self, symbol: str, side: OrderSide, qty: float, price: float,
+    ) -> str:
+        r = await _retry(
+            lambda: self._c().futures_create_order(
+                symbol=symbol,
+                side=side,
+                type="LIMIT",
+                quantity=qty,
+                price=price,
+                timeInForce="GTC",
+            ),
+            what=f"limit_order[{symbol}]",
+        )
+        return str(r["orderId"])
+
+    async def get_open_orders(self, symbol: str) -> List[LimitOrder]:
+        raw = await _retry(
+            lambda: self._c().futures_get_open_orders(symbol=symbol),
+            what=f"get_open_orders[{symbol}]",
+        )
+        out: List[LimitOrder] = []
+        for o in raw:
+            if o.get("type") != "LIMIT":
+                continue
+            out.append(LimitOrder(
+                order_id=str(o["orderId"]),
+                symbol=o["symbol"],
+                side=o["side"],
+                qty=float(o["origQty"]),
+                price=float(o["price"]),
+                status=o["status"],
+                filled_qty=float(o.get("executedQty", 0)),
+                filled_price=float(o.get("avgPrice", 0)),
+                fee=0.0,
+            ))
+        return out
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        try:
+            await self._c().futures_cancel_order(
+                symbol=symbol, orderId=int(order_id),
+            )
+            return True
+        except BinanceAPIException:
+            return False
+
+    async def cancel_all_orders(self, symbol: str) -> int:
+        orders = await self.get_open_orders(symbol)
+        count = len(orders)
+        if count == 0:
+            return 0
+        try:
+            await self._c().futures_cancel_all_open_orders(symbol=symbol)
+        except BinanceAPIException:
+            # Fallback: cancel individually
+            for o in orders:
+                try:
+                    await self._c().futures_cancel_order(
+                        symbol=symbol, orderId=int(o.order_id),
+                    )
+                except BinanceAPIException:
+                    count -= 1
+        return count
+
+    # ---- symbol scanning ----
+
+    async def get_all_tickers(self) -> List[TickerInfo]:
+        raw = await _retry(
+            lambda: self._c().futures_ticker(),
+            what="futures_ticker",
+        )
+        out: List[TickerInfo] = []
+        for t in raw:
+            sym = t["symbol"]
+            if not sym.endswith("USDT"):
+                continue
+            out.append(TickerInfo(
+                symbol=sym,
+                price=float(t["lastPrice"]),
+                volume_24h=float(t["quoteVolume"]),
+                change_pct_24h=float(t["priceChangePercent"]),
+                high_24h=float(t["highPrice"]),
+                low_24h=float(t["lowPrice"]),
+            ))
+        return out
+
+    async def get_all_symbol_filters(self) -> Dict[str, SymbolFilters]:
+        if self._filters_cache:
+            return dict(self._filters_cache)
+        info = await _retry(
+            lambda: self._c().futures_exchange_info(),
+            what="futures_exchange_info",
+        )
+        result: Dict[str, SymbolFilters] = {}
+        for s in info["symbols"]:
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("status") != "TRADING":
+                continue
+            symbol = s["symbol"]
+            tick = 0.0001
+            step = 0.001
+            min_qty = 0.001
+            min_notional = 5.0
+            for f in s["filters"]:
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                elif f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+                    min_qty = float(f["minQty"])
+                elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
+                    min_notional = float(
+                        f.get("notional") or f.get("minNotional") or 5.0
+                    )
+            sf = SymbolFilters(
+                symbol=symbol,
+                price_tick=tick,
+                qty_step=step,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
+            result[symbol] = sf
+        self._filters_cache = result
+        return dict(result)
 
 
 __all__ = ["BinanceLiveExchange"]

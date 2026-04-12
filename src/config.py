@@ -97,19 +97,28 @@ class AIConfig(BaseModel):
     model: str = "MiniMax-M2.7"
     max_tokens: int = 2048
     thinking: bool = False  # set true to use extended thinking mode
-    max_leverage: int = 5   # hard cap on leverage the AI may request
-    min_confidence: float = 0.6  # skip signals below this confidence
-    kline_history: int = 80      # candles included in the prompt
-    htf_history: int = 40        # HTF candles included in the prompt
-    request_timeout_s: float = 60.0
+    max_leverage: int = 20  # hard cap on leverage the AI may request
+    kline_history: int = 50      # candles included in the prompt
+    htf_history: int = 30        # HTF candles included in the prompt
+    request_timeout_s: float = 90.0
     retries: int = 2
 
 
+class GridConfig(BaseModel):
+    """Grid-specific settings. The AI sets the actual grid parameters
+    (symbol, upper/lower bounds, levels, leverage) at runtime; these are
+    constraints and defaults the AI must stay within."""
+
+    max_grids: int = 15               # max grid levels AI may create
+    min_grids: int = 3                # minimum grid levels
+    rebalance_check_minutes: int = 60 # how often to ask AI to re-evaluate
+    out_of_range_pct: float = 2.0     # % outside grid to trigger AI re-eval
+    max_unrealized_loss_pct: float = 5.0  # force-close grid if uPnL exceeds this
+
+
 class BotConfig(BaseModel):
-    symbols: List[str] = Field(default_factory=lambda: ["DOGEUSDT"])
     timeframe: str = "15m"
     htf_timeframe: str = "1h"
-    leverage: int = 3
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
@@ -117,16 +126,12 @@ class BotConfig(BaseModel):
     simulator: SimulatorConfig = Field(default_factory=SimulatorConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
-    loop_interval_seconds: int = 15
+    grid: GridConfig = Field(default_factory=GridConfig)
+    loop_interval_seconds: int = 10
     kline_history: int = 200
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
     state_file: str = "state/bot_state.json"
-
-    @field_validator("symbols")
-    @classmethod
-    def uppercase_symbols(cls, v: List[str]) -> List[str]:
-        return [s.upper().strip() for s in v]
 
 
 # --- Loader ---

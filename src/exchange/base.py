@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import pandas as pd
 
@@ -44,6 +44,31 @@ class LivePosition:
     mark_price: float
     unrealized_pnl: float
     leverage: int
+
+
+@dataclass
+class LimitOrder:
+    """A pending or filled limit order."""
+    order_id: str
+    symbol: str
+    side: OrderSide
+    qty: float
+    price: float
+    status: str                # NEW / FILLED / CANCELED
+    filled_qty: float = 0.0
+    filled_price: float = 0.0
+    fee: float = 0.0
+
+
+@dataclass
+class TickerInfo:
+    """24h ticker snapshot for symbol scanning."""
+    symbol: str
+    price: float
+    volume_24h: float          # 24h quote volume (USDT)
+    change_pct_24h: float      # 24h price change %
+    high_24h: float
+    low_24h: float
 
 
 class ExchangeInterface(ABC):
@@ -97,12 +122,43 @@ class ExchangeInterface(ABC):
     @abstractmethod
     async def get_open_positions(self) -> List[LivePosition]: ...
 
+    # ---- limit order interface (for grid trading) ----
+
+    @abstractmethod
+    async def limit_order(
+        self, symbol: str, side: OrderSide, qty: float, price: float,
+    ) -> str:
+        """Place a GTC limit order. Returns order_id."""
+
+    @abstractmethod
+    async def get_open_orders(self, symbol: str) -> List[LimitOrder]: ...
+
+    @abstractmethod
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel a pending order. Returns True if cancelled."""
+
+    @abstractmethod
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol. Returns count cancelled."""
+
+    # ---- symbol scanning (for AI grid selection) ----
+
+    @abstractmethod
+    async def get_all_tickers(self) -> List[TickerInfo]:
+        """Fetch 24h ticker data for all USDT-M perpetual symbols."""
+
+    @abstractmethod
+    async def get_all_symbol_filters(self) -> Dict[str, SymbolFilters]:
+        """Fetch exchange filters for all symbols (cached)."""
+
 
 __all__ = [
     "ExchangeInterface",
     "SymbolFilters",
     "OrderResult",
     "LivePosition",
+    "LimitOrder",
+    "TickerInfo",
     "OrderSide",
     "PositionSide",
 ]

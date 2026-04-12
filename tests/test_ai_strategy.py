@@ -1,15 +1,14 @@
-"""AI strategy tests — exercise parsing, validation and the evaluate() pipeline
-with a stubbed Anthropic client so no network calls happen.
+"""AI grid strategy tests — exercise parsing, symbol selection, and grid param
+decisions with a stubbed Anthropic client so no network calls happen.
 """
 import json
 from types import SimpleNamespace
 
-import numpy as np
-import pandas as pd
 import pytest
 
-from src.config import AIConfig, StrategyConfig
-from src.strategy.ai_strategy import AIStrategy, _extract_json, _AIDecision
+from src.config import AIConfig, GridConfig
+from src.exchange.base import SymbolFilters, TickerInfo
+from src.strategy.ai_strategy import AIGridStrategy, _extract_json
 
 
 class _StubMessages:
@@ -29,43 +28,42 @@ class _StubClient:
         self.messages = _StubMessages(reply)
 
 
-def _make_df(n: int = 100, start: float = 100.0, step: float = 0.1) -> pd.DataFrame:
-    idx = pd.date_range("2026-01-01", periods=n, freq="15min", tz="UTC")
-    closes = np.array([start + i * step for i in range(n)])
-    highs = closes + 0.2
-    lows = closes - 0.2
-    opens = closes - 0.05
-    volumes = np.full(n, 1000.0)
-    return pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes},
-        index=idx,
-    )
-
-
-def _make_htf(n: int = 80, start: float = 100.0) -> pd.DataFrame:
-    idx = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
-    closes = np.array([start + i * 0.5 for i in range(n)])
-    return pd.DataFrame(
-        {
-            "open": closes - 0.1,
-            "high": closes + 0.3,
-            "low": closes - 0.3,
-            "close": closes,
-            "volume": np.full(n, 2000.0),
-        },
-        index=idx,
-    )
-
-
-def _strategy_with_reply(reply: str) -> AIStrategy:
-    return AIStrategy(
-        ai_cfg=AIConfig(min_confidence=0.5, retries=0),
-        strategy_cfg=StrategyConfig(),
+def _strategy_with_reply(reply: str) -> AIGridStrategy:
+    return AIGridStrategy(
+        ai_cfg=AIConfig(retries=0),
+        grid_cfg=GridConfig(),
         api_key="test",
         base_url="https://example.invalid",
         client=_StubClient(reply),
     )
 
+
+def _make_tickers():
+    return [
+        TickerInfo(
+            symbol="DOGEUSDT", price=0.15, volume_24h=200_000_000,
+            change_pct_24h=2.5, high_24h=0.155, low_24h=0.145,
+        ),
+        TickerInfo(
+            symbol="BTCUSDT", price=60000.0, volume_24h=500_000_000,
+            change_pct_24h=-0.5, high_24h=61000.0, low_24h=59000.0,
+        ),
+        TickerInfo(
+            symbol="1000PEPEUSDT", price=0.008, volume_24h=100_000_000,
+            change_pct_24h=5.0, high_24h=0.0085, low_24h=0.0075,
+        ),
+    ]
+
+
+def _make_filters():
+    return {
+        "DOGEUSDT": SymbolFilters("DOGEUSDT", 0.00001, 1.0, 1.0, 5.0),
+        "BTCUSDT": SymbolFilters("BTCUSDT", 0.01, 0.001, 0.001, 5.0),
+        "1000PEPEUSDT": SymbolFilters("1000PEPEUSDT", 0.0000001, 1.0, 1.0, 5.0),
+    }
+
+
+# ---- JSON extraction ----
 
 def test_extract_json_plain():
     assert _extract_json('{"a": 1}') == {"a": 1}
@@ -77,7 +75,7 @@ def test_extract_json_with_fence():
 
 
 def test_extract_json_with_prose():
-    text = "here is my decision {\"side\": \"SHORT\", \"confidence\": 0.8}. thanks!"
+    text = 'here is my decision {"side": "SHORT", "confidence": 0.8}. thanks!'
     out = _extract_json(text)
     assert out is not None and out["side"] == "SHORT"
 
@@ -86,195 +84,159 @@ def test_extract_json_garbage():
     assert _extract_json("not json at all") is None
 
 
-def test_parse_decision_rejects_invalid_side():
-    assert AIStrategy._parse_decision('{"side": "MAYBE"}') is None
-
-
-def test_sanity_check_rejects_sl_on_wrong_side():
-    s = _strategy_with_reply("{}")
-    bad = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=105.0,
-        take_profits=[(101.0, 40), (102.0, 30), (103.0, 30)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(bad) is False
-
-
-def test_sanity_check_accepts_unordered_tps():
-    # AI provides TPs in any order — they are still structurally valid.
-    # The strategy will sort them by distance before handing to the bot.
-    s = _strategy_with_reply("{}")
-    mixed = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=98.0,
-        take_profits=[(108.0, 30), (101.5, 40), (104.0, 30)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(mixed) is True
-
-
-def test_sanity_check_rejects_close_pct_sum_mismatch():
-    s = _strategy_with_reply("{}")
-    bad = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=98.0,
-        take_profits=[(101.0, 40), (102.0, 30), (103.0, 20)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(bad) is False
-
-
-def test_sanity_check_accepts_valid_long():
-    s = _strategy_with_reply("{}")
-    good = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=98.0,
-        take_profits=[(101.5, 40), (104.0, 30), (108.0, 30)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(good) is True
-
-
-def test_sanity_check_accepts_low_rr():
-    # A tight TP1 is the AI's choice — we no longer enforce any R:R floor.
-    s = _strategy_with_reply("{}")
-    tight = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=98.0,
-        take_profits=[(100.5, 40), (104.0, 30), (108.0, 30)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(tight) is True
-
-
-def test_sanity_check_accepts_single_tp():
-    # 1 TP at 100% close is a valid all-in exit plan.
-    s = _strategy_with_reply("{}")
-    single = _AIDecision(
-        side="SHORT", confidence=0.9, entry_price=100.0, stop_loss=102.0,
-        take_profits=[(95.0, 100)], leverage=2, reasoning="x",
-    )
-    assert s._sanity_check(single) is True
-
-
-def test_sanity_check_rejects_tp_on_wrong_side_for_long():
-    # TP below entry on a LONG is physically impossible to hit as profit.
-    s = _strategy_with_reply("{}")
-    bad = _AIDecision(
-        side="LONG", confidence=0.9, entry_price=100.0, stop_loss=98.0,
-        take_profits=[(95.0, 40), (104.0, 30), (108.0, 30)], leverage=3, reasoning="x",
-    )
-    assert s._sanity_check(bad) is False
-
+# ---- Symbol selection ----
 
 @pytest.mark.asyncio
-async def test_evaluate_happy_path_long():
+async def test_select_symbol_happy_path():
     reply = json.dumps({
-        "side": "LONG",
-        "confidence": 0.8,
-        "entry_price": 109.9,
-        "stop_loss": 108.4,
-        "take_profits": [
-            {"price": 112.0, "close_pct": 40},
-            {"price": 115.0, "close_pct": 30},
-            {"price": 120.0, "close_pct": 30},
-        ],
-        "leverage": 3,
-        "reasoning": "clean uptrend",
+        "symbol": "DOGEUSDT",
+        "reasoning": "good volume and range",
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is not None
-    assert sig.side == "LONG"
-    assert sig.leverage == 3
-    assert sig.stop_loss == 108.4
-    assert sig.take_profits is not None and len(sig.take_profits) == 3
-    assert sig.confidence == 0.8
-    assert "clean uptrend" in sig.reason
+    choice = await s.select_symbol(_make_tickers(), _make_filters())
+    assert choice is not None
+    assert choice.symbol == "DOGEUSDT"
+    assert "volume" in choice.reasoning.lower() or len(choice.reasoning) > 0
 
 
 @pytest.mark.asyncio
-async def test_evaluate_none_decision_returns_none():
+async def test_select_symbol_invalid_pick():
     reply = json.dumps({
-        "side": "NONE", "confidence": 0.0,
-        "entry_price": 0, "stop_loss": 0,
-        "take_profits": [],
-        "leverage": 1, "reasoning": "no edge",
+        "symbol": "INVALIDUSDT",
+        "reasoning": "this does not exist",
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is None
+    choice = await s.select_symbol(_make_tickers(), _make_filters())
+    assert choice is None
 
 
 @pytest.mark.asyncio
-async def test_evaluate_low_confidence_skipped():
+async def test_select_symbol_bad_json():
+    s = _strategy_with_reply("sorry, can't help")
+    choice = await s.select_symbol(_make_tickers(), _make_filters())
+    assert choice is None
+
+
+# ---- Grid parameter decisions ----
+
+@pytest.mark.asyncio
+async def test_decide_grid_params_happy_path():
     reply = json.dumps({
-        "side": "LONG", "confidence": 0.3,
-        "entry_price": 109.9, "stop_loss": 108.4,
-        "take_profits": [
-            {"price": 112.0, "close_pct": 40},
-            {"price": 115.0, "close_pct": 30},
-            {"price": 120.0, "close_pct": 30},
-        ],
-        "leverage": 3, "reasoning": "meh",
+        "upper_price": 0.155,
+        "lower_price": 0.145,
+        "num_grids": 5,
+        "leverage": 10,
+        "qty_per_grid": 50.0,
+        "reasoning": "tight range around current price",
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is None
+    ticker = _make_tickers()[0]  # DOGEUSDT
+    filters = _make_filters()["DOGEUSDT"]
+    decision = await s.decide_grid_params(
+        symbol="DOGEUSDT",
+        current_price=0.15,
+        ticker=ticker,
+        filters=filters,
+        balance=10.0,
+    )
+    assert decision is not None
+    assert decision.upper_price == 0.155
+    assert decision.lower_price == 0.145
+    assert decision.num_grids == 5
+    assert decision.leverage == 10
 
 
 @pytest.mark.asyncio
-async def test_evaluate_clamps_to_max_leverage():
+async def test_decide_grid_params_price_outside_range():
     reply = json.dumps({
-        "side": "LONG", "confidence": 0.9,
-        "entry_price": 109.9, "stop_loss": 108.4,
-        "take_profits": [
-            {"price": 112.0, "close_pct": 40},
-            {"price": 115.0, "close_pct": 30},
-            {"price": 120.0, "close_pct": 30},
-        ],
-        "leverage": 50, "reasoning": "aggressive",
+        "upper_price": 0.10,
+        "lower_price": 0.09,
+        "num_grids": 5,
+        "leverage": 10,
+        "qty_per_grid": 50.0,
+        "reasoning": "wrong range",
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is not None
-    assert sig.leverage == s.ai.max_leverage
+    ticker = _make_tickers()[0]
+    filters = _make_filters()["DOGEUSDT"]
+    decision = await s.decide_grid_params(
+        symbol="DOGEUSDT",
+        current_price=0.15,
+        ticker=ticker,
+        filters=filters,
+        balance=10.0,
+    )
+    assert decision is None  # current price outside range
 
 
 @pytest.mark.asyncio
-async def test_evaluate_bad_json_returns_none():
-    s = _strategy_with_reply("sorry I cannot help")
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is None
-
-
-@pytest.mark.asyncio
-async def test_evaluate_sorts_tps_by_distance():
-    # AI returns TPs in arbitrary order — strategy must sort them by
-    # distance from entry so TP1 is nearest, TP3 is furthest.
+async def test_decide_grid_params_too_many_grids():
     reply = json.dumps({
-        "side": "LONG", "confidence": 0.9,
-        "entry_price": 109.9, "stop_loss": 108.4,
-        "take_profits": [
-            {"price": 120.0, "close_pct": 30},   # furthest
-            {"price": 112.0, "close_pct": 40},   # nearest
-            {"price": 115.0, "close_pct": 30},   # middle
-        ],
-        "leverage": 3, "reasoning": "three targets out of order",
+        "upper_price": 0.155,
+        "lower_price": 0.145,
+        "num_grids": 50,  # exceeds max_grids
+        "leverage": 10,
+        "qty_per_grid": 50.0,
+        "reasoning": "too many",
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is not None
-    assert sig.take_profits is not None
-    prices = [p for p, _ in sig.take_profits]
-    assert prices == [112.0, 115.0, 120.0]
+    ticker = _make_tickers()[0]
+    filters = _make_filters()["DOGEUSDT"]
+    decision = await s.decide_grid_params(
+        symbol="DOGEUSDT",
+        current_price=0.15,
+        ticker=ticker,
+        filters=filters,
+        balance=10.0,
+    )
+    assert decision is None
+
+
+# ---- Rebalance evaluation ----
+
+@pytest.mark.asyncio
+async def test_evaluate_rebalance_hold():
+    reply = json.dumps({
+        "action": "HOLD",
+        "reasoning": "price will return",
+        "new_upper": None,
+        "new_lower": None,
+        "new_num_grids": None,
+        "new_leverage": None,
+        "new_qty_per_grid": None,
+    })
+    s = _strategy_with_reply(reply)
+    summary = {
+        "symbol": "DOGEUSDT", "upper": 0.155, "lower": 0.145,
+        "num_grids": 5, "spacing": 0.002, "leverage": 10,
+        "qty_per_grid": 50.0, "total_profit": 0.001, "round_trips": 3,
+        "net_qty": 50.0, "unrealized_pnl": -0.002, "mark_price": 0.157,
+    }
+    filters = _make_filters()["DOGEUSDT"]
+    decision = await s.evaluate_rebalance("DOGEUSDT", summary, 10.0, filters)
+    assert decision.action == "HOLD"
 
 
 @pytest.mark.asyncio
-async def test_evaluate_pads_single_tp_to_three_slots():
+async def test_evaluate_rebalance_rebalance():
     reply = json.dumps({
-        "side": "LONG", "confidence": 0.9,
-        "entry_price": 109.9, "stop_loss": 108.4,
-        "take_profits": [{"price": 115.0, "close_pct": 100}],
-        "leverage": 3, "reasoning": "single target",
+        "action": "REBALANCE",
+        "reasoning": "price moved too far",
+        "new_upper": 0.165,
+        "new_lower": 0.155,
+        "new_num_grids": 5,
+        "new_leverage": 10,
+        "new_qty_per_grid": 50.0,
     })
     s = _strategy_with_reply(reply)
-    sig = await s.evaluate("DOGEUSDT", _make_df(), _make_htf())
-    assert sig is not None
-    assert sig.take_profits is not None
-    assert len(sig.take_profits) == 3
-    # First TP carries the full 100% close; the fillers are 0%.
-    assert sig.take_profits[0] == (115.0, 100)
-    assert sig.take_profits[1][1] == 0
-    assert sig.take_profits[2][1] == 0
+    summary = {
+        "symbol": "DOGEUSDT", "upper": 0.155, "lower": 0.145,
+        "num_grids": 5, "spacing": 0.002, "leverage": 10,
+        "qty_per_grid": 50.0, "total_profit": 0.001, "round_trips": 3,
+        "net_qty": 50.0, "unrealized_pnl": -0.002, "mark_price": 0.16,
+    }
+    filters = _make_filters()["DOGEUSDT"]
+    decision = await s.evaluate_rebalance("DOGEUSDT", summary, 10.0, filters)
+    assert decision.action == "REBALANCE"
+    assert decision.new_params is not None
+    assert decision.new_params.upper_price == 0.165
