@@ -41,18 +41,28 @@ def compute_grid_prices(lower: float, upper: float, num_grids: int) -> List[floa
     return [lower + i * step for i in range(num_grids + 1)]
 
 
+def _precision(tick: float) -> int:
+    """Derive decimal precision from a tick/step size (e.g. 0.001 -> 3)."""
+    s = f"{tick:.12f}".rstrip("0")
+    if "." in s:
+        return len(s.split(".")[1])
+    return 0
+
+
 def round_price(price: float, tick: float) -> float:
-    """Round a price to the nearest tick size."""
+    """Round a price to the nearest tick size with correct precision."""
     if tick <= 0:
         return price
-    return round(round(price / tick) * tick, 12)
+    p = _precision(tick)
+    return round(round(price / tick) * tick, p)
 
 
 def round_qty(qty: float, step: float) -> float:
-    """Round qty down to the nearest step size."""
+    """Round qty down to the nearest step size with correct precision."""
     if step <= 0:
         return qty
-    return math.floor(qty / step + 1e-9) * step
+    p = _precision(step)
+    return round(math.floor(qty / step + 1e-9) * step, p)
 
 
 class GridManager:
