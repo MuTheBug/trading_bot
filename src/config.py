@@ -21,6 +21,12 @@ class Secrets(BaseSettings):
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     run_mode: Literal["sim", "live"] = Field(default="sim", alias="RUN_MODE")
 
+    # MiniMax (Anthropic-compatible) API — the AI brain driving trade decisions
+    ai_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    ai_base_url: str = Field(
+        default="https://api.minimax.io/anthropic", alias="ANTHROPIC_BASE_URL"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -84,27 +90,48 @@ class TelegramConfig(BaseModel):
     daily_summary_utc_hour: int = 0
 
 
+class AIConfig(BaseModel):
+    """AI-driven strategy configuration (MiniMax M2.7 via Anthropic-compatible API)."""
+
+    enabled: bool = True
+    model: str = "MiniMax-M2.7"
+    max_tokens: int = 2048
+    thinking: bool = False  # set true to use extended thinking mode
+    max_leverage: int = 20  # hard cap on leverage the AI may request
+    kline_history: int = 50      # candles included in the prompt
+    htf_history: int = 30        # HTF candles included in the prompt
+    request_timeout_s: float = 90.0
+    retries: int = 2
+
+
+class GridConfig(BaseModel):
+    """Grid-specific settings. The AI sets the actual grid parameters
+    (symbol, upper/lower bounds, levels, leverage) at runtime; these are
+    constraints and defaults the AI must stay within."""
+
+    max_grids: int = 15               # max grid levels AI may create
+    min_grids: int = 3                # minimum grid levels
+    rebalance_check_minutes: int = 60 # how often to ask AI to re-evaluate
+    out_of_range_pct: float = 2.0     # % outside grid to trigger AI re-eval
+    max_unrealized_loss_pct: float = 5.0  # force-close grid if uPnL exceeds this
+
+
 class BotConfig(BaseModel):
-    symbols: List[str] = Field(default_factory=lambda: ["DOGEUSDT"])
     timeframe: str = "15m"
     htf_timeframe: str = "1h"
-    leverage: int = 3
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     exits: ExitsConfig = Field(default_factory=ExitsConfig)
     simulator: SimulatorConfig = Field(default_factory=SimulatorConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    loop_interval_seconds: int = 15
+    ai: AIConfig = Field(default_factory=AIConfig)
+    grid: GridConfig = Field(default_factory=GridConfig)
+    loop_interval_seconds: int = 10
     kline_history: int = 200
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
     state_file: str = "state/bot_state.json"
-
-    @field_validator("symbols")
-    @classmethod
-    def uppercase_symbols(cls, v: List[str]) -> List[str]:
-        return [s.upper().strip() for s in v]
 
 
 # --- Loader ---
