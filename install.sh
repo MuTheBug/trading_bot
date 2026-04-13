@@ -8,13 +8,15 @@ cd "$SCRIPT_DIR"
 
 FORCE=0
 AI_FIX_CLI=0
+UPDATE_MODE=0
 for arg in "$@"; do
     case "$arg" in
         -f|--force) FORCE=1 ;;
         -a|--ai-fix) AI_FIX_CLI=1 ;;
+        -u|--update) UPDATE_MODE=1 ;;
         -h|--help)
             cat <<EOF
-Usage: ./install.sh [--force] [--ai-fix]
+Usage: ./install.sh [--force] [--ai-fix] [--update]
 
 Creates a Python venv, installs dependencies, and interactively asks for:
   - Binance API key / secret
@@ -24,19 +26,9 @@ Creates a Python venv, installs dependencies, and interactively asks for:
 
 Writes .env (chmod 600) and config.yaml. Re-run with --force to overwrite.
 
---ai-fix    Enable AI-assisted install pipeline:
-              1. Preflight scan — collects OS, package manager, Python,
-                 gcc/make/rustc/cargo availability, venv module status —
-                 sends it to MiniMax-M2.7 and auto-applies any suggested
-                 environment prep commands.
-              2. Retry loop — if venv / pip-upgrade / pip-install fails,
-                 the error log is sent to MiniMax-M2.7 and the suggested
-                 fix commands are auto-applied.
-            All suggested commands are printed before execution and are
-            filtered against a denylist of obviously destructive patterns
-            (rm -rf /, mkfs, dd, shutdown, fork bombs, chmod 777 /) so
-            auto-accept stays safe. Reads the API key from
-            ANTHROPIC_API_KEY if set; otherwise prompts you.
+--update    Pull latest code, show what changed, reinstall deps if needed.
+--ai-fix    Enable AI-assisted install pipeline with step-by-step guidance.
+--force     Overwrite existing .env and config.yaml.
 EOF
             exit 0 ;;
     esac
@@ -74,6 +66,195 @@ elif [ "$IS_TERMUX" -eq 1 ] && command -v python >/dev/null 2>&1; then
 else
     PYTHON_BIN="python3"  # will fail at the version check with a clear error
 fi
+
+# ---------- Step progress + AI narration ------------------------------------
+TOTAL_STEPS=9
+CURRENT_STEP=0
+
+step() {
+    # Usage: step "Short title"
+    # Prints a bold progress header: [Step 3/9] Short title
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    echo
+    echo "$(color '1;36' "━━━ [Step ${CURRENT_STEP}/${TOTAL_STEPS}] $1 ━━━")"
+}
+
+# AI narration: explains the current step to the user in plain language.
+# Only active when AI_FIX_ENABLED=1 and the key is available.
+# Falls back silently to nothing if AI is unavailable.
+ai_narrate() {
+    # Args: $1 = step description for the AI
+    if [ "${AI_FIX_ENABLED:-0}" -ne 1 ] || [ -z "${AI_FIX_KEY:-}" ]; then
+        return 0
+    fi
+    local payload text
+    payload=$(IS_TERMUX_ENV="$IS_TERMUX" AI_MODEL_ENV="$AI_FIX_MODEL" STEP_DESC="$1" \
+              STEP_NUM="$CURRENT_STEP" TOTAL="$TOTAL_STEPS" $PYTHON_BIN - <<'PYEOF' 2>/dev/null) || return 0
+import json, os
+body = {
+    "model": os.environ.get("AI_MODEL_ENV", "MiniMax-M2.7"),
+    "max_tokens": 150,
+    "system": (
+        "You are a friendly install assistant guiding a user through setting up "
+        "a Binance Futures grid trading bot. The user is on step "
+        f"{os.environ['STEP_NUM']}/{os.environ['TOTAL']}. "
+        + ("This is a Termux (Android) install. " if os.environ.get("IS_TERMUX_ENV") == "1" else "")
+        + "Give a brief 1-2 sentence explanation of what this step does and why. "
+        "Be encouraging. No markdown, no code blocks — plain text only."
+    ),
+    "messages": [{"role": "user", "content": os.environ["STEP_DESC"]}],
+}
+print(json.dumps(body))
+PYEOF
+    text=$(_minimax_call "$payload" 2>/dev/null) || return 0
+    # Print the AI narration indented
+    echo
+    echo "   $(color '0;37' "$text")"
+    echo
+}
+
+# ---------- Update mode (--update) ------------------------------------------
+do_update() {
+    echo
+    echo "$(color '1;36' '━━━ Updating trading bot ━━━')"
+    echo
+
+    if [ ! -d ".git" ]; then
+        err "Not a git repository. Clone it first:"
+        err "  git clone https://github.com/MuTheBug/trading_bot.git"
+        exit 1
+    fi
+
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    info "Current branch: $current_branch"
+
+    # Check for local changes
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        warn "You have uncommitted local changes. Stashing them..."
+        git stash push -m "install.sh --update auto-stash" 2>/dev/null || true
+    fi
+
+    # Fetch and show what's new
+    info "Fetching latest changes..."
+    local fetch_ok=0
+    for attempt in 1 2 3 4; do
+        if git fetch origin "$current_branch" 2>/dev/null; then
+            fetch_ok=1
+            break
+        fi
+        local delay=$((2 ** attempt))
+        warn "Fetch failed (attempt $attempt/4), retrying in ${delay}s..."
+        sleep "$delay"
+    done
+
+    if [ "$fetch_ok" -eq 0 ]; then
+        err "Could not fetch from remote after 4 attempts."
+        exit 1
+    fi
+
+    # Show changelog
+    local ahead behind
+    ahead=$(git rev-list --count "origin/$current_branch..HEAD" 2>/dev/null || echo 0)
+    behind=$(git rev-list --count "HEAD..origin/$current_branch" 2>/dev/null || echo 0)
+
+    if [ "$behind" -eq 0 ]; then
+        ok "Already up to date! No new changes."
+        echo
+        return 0
+    fi
+
+    info "$behind new commit(s) available:"
+    echo
+    git --no-pager log --oneline --no-decorate "HEAD..origin/$current_branch" 2>/dev/null | \
+        head -20 | while IFS= read -r line; do
+            echo "   $(color '0;33' '•') $line"
+        done
+    echo
+
+    # Show changed files summary
+    info "Files changed:"
+    git --no-pager diff --stat "HEAD..origin/$current_branch" 2>/dev/null | \
+        head -30 | while IFS= read -r line; do
+            echo "   $line"
+        done
+    echo
+
+    # Check if requirements.txt changed
+    local reqs_changed=0
+    if git diff --name-only "HEAD..origin/$current_branch" 2>/dev/null | grep -q "requirements.txt"; then
+        reqs_changed=1
+        warn "requirements.txt changed — dependencies will be reinstalled"
+    fi
+
+    # Pull
+    info "Pulling changes..."
+    if ! git pull origin "$current_branch" 2>/dev/null; then
+        err "Pull failed. You may need to resolve conflicts manually."
+        exit 1
+    fi
+    ok "Code updated to latest version"
+
+    # Reinstall deps if requirements changed
+    if [ "$reqs_changed" -eq 1 ]; then
+        info "Reinstalling dependencies..."
+        if [ -d ".venv" ]; then
+            # shellcheck disable=SC1091
+            source .venv/bin/activate
+            pip install --prefer-binary -r requirements.txt 2>&1 | tail -5
+            ok "Dependencies updated"
+        else
+            warn ".venv not found — run ./install.sh without --update first"
+        fi
+    fi
+
+    # Verify imports
+    info "Verifying imports..."
+    if [ -d ".venv" ]; then
+        # shellcheck disable=SC1091
+        source .venv/bin/activate
+    fi
+    if $PYTHON_BIN -c "import src.config, src.bot, src.exchange.simulator, src.strategy.ai_strategy" 2>/dev/null; then
+        ok "imports OK"
+    else
+        warn "import check failed after update — run full ./install.sh to fix"
+    fi
+
+    # AI summary of the update
+    if [ "${AI_FIX_ENABLED:-0}" -eq 1 ] && [ -n "${AI_FIX_KEY:-}" ]; then
+        local changelog
+        changelog=$(git --no-pager log --oneline --no-decorate "HEAD~${behind}..HEAD" 2>/dev/null | head -10)
+        local payload text
+        payload=$(CHANGELOG="$changelog" AI_MODEL_ENV="$AI_FIX_MODEL" $PYTHON_BIN - <<'PYEOF' 2>/dev/null) || true
+import json, os
+body = {
+    "model": os.environ.get("AI_MODEL_ENV", "MiniMax-M2.7"),
+    "max_tokens": 200,
+    "system": (
+        "You are a friendly update assistant for a Binance Futures grid "
+        "trading bot. Summarize the changes in 2-3 sentences. Be brief and "
+        "highlight anything the user should know (new features, bug fixes, "
+        "breaking changes). Plain text only, no markdown."
+    ),
+    "messages": [{"role": "user", "content": f"Commits pulled:\n{os.environ['CHANGELOG']}"}],
+}
+print(json.dumps(body))
+PYEOF
+        if [ -n "$payload" ]; then
+            text=$(_minimax_call "$payload" 2>/dev/null) || true
+            if [ -n "$text" ]; then
+                echo
+                echo "   $(color '1;35' 'AI Summary:') $text"
+            fi
+        fi
+    fi
+
+    echo
+    ok "Update complete! Restart the bot to use the new version."
+    echo "   ./run.sh"
+    echo
+    exit 0
+}
 
 # --------------------------------------------------------------------------
 # AI-assisted install pipeline.
@@ -687,7 +868,25 @@ for c in obj.get("fix_commands", []) or []:
     done
 }
 
+# ---------- Run update mode if requested (after all functions are defined) ---
+if [ "$UPDATE_MODE" -eq 1 ]; then
+    # Load AI key from .env if available for update summary
+    if [ -f ".env" ]; then
+        AI_FIX_KEY="${ANTHROPIC_API_KEY:-$(grep -oP 'ANTHROPIC_API_KEY=\K.*' .env 2>/dev/null || true)}"
+        if [ -n "$AI_FIX_KEY" ] && [ "$AI_FIX_CLI" -eq 1 ]; then
+            AI_FIX_ENABLED=1
+        fi
+    fi
+    do_update
+fi
+
+# ===========================================================================
+# FULL INSTALL FLOW
+# ===========================================================================
+
 # --- 1. Python version check ------------------------------------------------
+step "Checking Python"
+ai_narrate "Checking that Python 3.11+ is installed and working"
 info "Checking Python..."
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     if [ "$IS_TERMUX" -eq 1 ]; then
@@ -715,7 +914,8 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }
 fi
 ok "Python $PY_VER ($([ "$IS_TERMUX" -eq 1 ] && echo 'Termux' || echo 'system'))"
 
-# --- 1.5 AI-assisted error recovery opt-in ---------------------------------
+# --- 2. AI-assisted error recovery opt-in ---------------------------------
+step "AI-Assisted Setup"
 if [ "$AI_FIX_CLI" -eq 1 ]; then
     if [ -z "$AI_FIX_KEY" ]; then
         echo
@@ -755,15 +955,19 @@ else
     esac
 fi
 
-# --- 1.6 Preflight AI environment prep -------------------------------------
+# --- 3. Preflight AI environment prep -------------------------------------
 # If AI auto-fix is enabled, collect an OS/toolchain snapshot, send it to
 # MiniMax-M2.7, and auto-apply whatever setup commands it suggests BEFORE we
 # try to build the venv / install requirements. This catches classic missing
 # deps (python3-venv on Debian, build tools on RHEL, rustc for jiter on
 # arches without prebuilt wheels) before they turn into failed retries.
+step "Preflight Environment Scan"
+ai_narrate "Scanning your system for missing build tools and libraries before we start installing"
 preflight_run
 
-# --- 2. venv ----------------------------------------------------------------
+# --- 4. venv ----------------------------------------------------------------
+step "Creating Virtual Environment"
+ai_narrate "Setting up an isolated Python environment so the bot's dependencies don't conflict with your system packages"
 if [ ! -d ".venv" ]; then
     info "Creating virtualenv at .venv ..."
     if ! run_with_ai_fix "create virtualenv" $PYTHON_BIN -m venv .venv; then
@@ -785,6 +989,8 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
+step "Installing Dependencies"
+ai_narrate "Installing all Python packages the bot needs: Binance API client, pandas for data, telegram for alerts, AI SDK, and more. This is the longest step."
 info "Upgrading pip / setuptools / wheel..."
 if ! run_with_ai_fix "upgrade pip toolchain" pip install --upgrade pip setuptools wheel; then
     err "pip toolchain upgrade failed."
@@ -800,7 +1006,9 @@ if ! run_with_ai_fix "install requirements" pip install --prefer-binary -r requi
 fi
 ok "dependencies installed"
 
-# --- 3. config.yaml ---------------------------------------------------------
+# --- 6. config.yaml ---------------------------------------------------------
+step "Configuration Files"
+ai_narrate "Setting up config.yaml with default trading parameters and preparing .env for your API credentials"
 if [ -f "config.yaml" ] && [ "$FORCE" -eq 0 ]; then
     ok "config.yaml already present (use --force to overwrite)"
 else
@@ -808,7 +1016,9 @@ else
     ok "config.yaml created from config.example.yaml"
 fi
 
-# --- 4. .env prompt ---------------------------------------------------------
+# --- 7. .env prompt ---------------------------------------------------------
+step "API Credentials"
+ai_narrate "Now we need your Binance, Telegram, and MiniMax API keys. These are stored locally in .env with restricted permissions — never shared."
 if [ -f ".env" ] && [ "$FORCE" -eq 0 ]; then
     ok ".env already present (use --force to re-prompt)"
 else
@@ -874,14 +1084,14 @@ EOF
     ok ".env written (chmod 600)"
 fi
 
-# --- 5. make run.sh executable ---------------------------------------------
+# --- make run.sh executable + runtime dirs ----------------------------------
 chmod +x run.sh 2>/dev/null || true
-
-# --- 6. create runtime dirs ------------------------------------------------
 mkdir -p logs state
 ok "logs/ and state/ directories ready"
 
-# --- 7. smoke-check imports ------------------------------------------------
+# --- 8. smoke-check imports ------------------------------------------------
+step "Verifying Installation"
+ai_narrate "Almost done! Checking that all Python modules import correctly and testing connectivity to your configured services."
 info "Verifying imports..."
 if $PYTHON_BIN -c "import src.config, src.bot, src.exchange.simulator, src.strategy.ai_strategy" 2>/dev/null; then
     ok "imports OK"
@@ -889,7 +1099,8 @@ else
     warn "import check failed — run '$PYTHON_BIN -c \"import src.bot\"' to debug"
 fi
 
-# --- 8. optional connectivity check ----------------------------------------
+# --- 9. optional connectivity check ----------------------------------------
+step "Connectivity Check"
 if [ -f ".env" ]; then
     read -rp "   Run a connectivity check against Binance + Telegram + MiniMax now? [Y/n]: " CONN
     case "${CONN:-Y}" in
