@@ -67,8 +67,98 @@ else
     PYTHON_BIN="python3"  # will fail at the version check with a clear error
 fi
 
+# Helper: extract value from .env file (no grep -P, works on Termux/BusyBox)
+_env_val() {
+    # Usage: _env_val KEY /path/to/.env
+    local key="$1" file="$2"
+    if [ ! -f "$file" ]; then return 1; fi
+    sed -n "s/^${key}=//p" "$file" 2>/dev/null | head -1
+}
+
+# ---------- Get AI key IMMEDIATELY so every step gets AI help ---------------
+# This runs before any function definitions so even early failures can be fixed.
+echo
+info "$(color '1;35' '🤖 AI-Guided Installation')"
+echo "   This installer uses MiniMax-M2.7 to guide you step-by-step."
+echo "   If ANY step fails, the AI diagnoses the error and fixes it."
+echo
+
+AI_FIX_KEY="${ANTHROPIC_API_KEY:-}"
+AI_FIX_URL="${ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}"
+AI_FIX_MODEL="${AI_MODEL:-MiniMax-M2.7}"
+AI_FIX_ENABLED=0
+
+# Try to load from existing .env
+if [ -z "$AI_FIX_KEY" ] && [ -f ".env" ]; then
+    AI_FIX_KEY="$(_env_val ANTHROPIC_API_KEY .env || true)"
+fi
+
+if [ -n "$AI_FIX_KEY" ]; then
+    AI_FIX_ENABLED=1
+    ok "AI key loaded from environment (model: $AI_FIX_MODEL)"
+else
+    echo "   You need a MiniMax API key for AI-guided install."
+    echo "   Get one free at:"
+    echo "   $(color '1;36' 'https://platform.minimax.io/user-center/basic-information/interface-key')"
+    echo
+    read -rsp "   Paste your MiniMax API Key here: " AI_FIX_KEY
+    echo
+    if [ -n "$AI_FIX_KEY" ]; then
+        AI_FIX_ENABLED=1
+        ok "AI guide activated! Every step will be monitored."
+    else
+        warn "No key entered — errors won't be auto-fixed. Press Ctrl+C and re-run to add one."
+    fi
+fi
+echo
+
+# When AI can't fix something, show the error + AI suggestion before exiting.
+ai_fail_exit() {
+    # Usage: ai_fail_exit "what failed" "error details"
+    local what="$1" detail="$2"
+    if [ "$AI_FIX_ENABLED" -ne 1 ] || [ -z "$AI_FIX_KEY" ]; then
+        err "$what"
+        err "$detail"
+        exit 1
+    fi
+    err "$what"
+    info "Asking AI for help..."
+    local log_file
+    log_file="$(mktemp)"
+    printf '%s\n%s' "$what" "$detail" > "$log_file"
+    local suggestion
+    if suggestion=$(ai_fix_suggest "install failure" "$what" "1" "$log_file" 2>/dev/null); then
+        rm -f "$log_file"
+        local diag cmds
+        diag=$(printf '%s' "$suggestion" | $PYTHON_BIN -c \
+            'import sys,json;print(json.load(sys.stdin).get("diagnosis",""))' \
+            2>/dev/null || echo "")
+        cmds=$(printf '%s' "$suggestion" | $PYTHON_BIN -c \
+'import sys,json
+obj = json.load(sys.stdin)
+for c in obj.get("fix_commands", []) or []:
+    c = str(c).strip()
+    if c:
+        print(c)' 2>/dev/null || true)
+        echo
+        echo "   $(color '1;36' 'AI Diagnosis:') ${diag:-(unknown)}"
+        if [ -n "$cmds" ]; then
+            echo "   $(color '1;36' 'Fix — run these commands:')"
+            while IFS= read -r c; do
+                [ -z "$c" ] && continue
+                echo "     $(color '1;33' '$') $c"
+            done <<< "$cmds"
+            echo
+            echo "   Then re-run: $(color '1;32' 'bash install.sh')"
+        fi
+    else
+        rm -f "$log_file"
+    fi
+    exit 1
+}
+
 # ---------- Step progress + AI narration ------------------------------------
-TOTAL_STEPS=9
+TOTAL_STEPS=8
 CURRENT_STEP=0
 
 step() {
@@ -282,10 +372,8 @@ PYEOF
 # Uses plain `curl` to call the Anthropic-compatible /v1/messages endpoint,
 # so there is no dependency on the `anthropic` SDK being installed yet.
 # --------------------------------------------------------------------------
-AI_FIX_ENABLED=0
-AI_FIX_KEY="${ANTHROPIC_API_KEY:-}"
-AI_FIX_URL="${ANTHROPIC_BASE_URL:-https://api.minimax.io/anthropic}"
-AI_FIX_MODEL="${AI_MODEL:-MiniMax-M2.7}"
+# AI_FIX_KEY, AI_FIX_URL, AI_FIX_MODEL, AI_FIX_ENABLED are already set above
+# (before function definitions) so the key prompt happens first.
 AI_FIX_MAX_ATTEMPTS=3
 
 # Reject obviously destructive commands so auto-accept stays safe.
@@ -872,7 +960,7 @@ for c in obj.get("fix_commands", []) or []:
 if [ "$UPDATE_MODE" -eq 1 ]; then
     # Load AI key from .env if available for update summary
     if [ -z "$AI_FIX_KEY" ] && [ -f ".env" ]; then
-        AI_FIX_KEY="${ANTHROPIC_API_KEY:-$(grep -oP 'ANTHROPIC_API_KEY=\K.*' .env 2>/dev/null || true)}"
+        AI_FIX_KEY="${ANTHROPIC_API_KEY:-$(_env_val ANTHROPIC_API_KEY .env || true)}"
     fi
     if [ -n "$AI_FIX_KEY" ]; then
         AI_FIX_ENABLED=1
@@ -881,50 +969,21 @@ if [ "$UPDATE_MODE" -eq 1 ]; then
 fi
 
 # ===========================================================================
-# FULL INSTALL FLOW
+# FULL INSTALL FLOW (AI key was already collected above, before functions)
 # ===========================================================================
 
-# --- 1. AI-Guided Install (ask for key FIRST so all steps get AI help) ------
-step "AI-Guided Install"
-echo
-info "$(color '1;35' 'This installer uses AI to guide you and auto-fix errors.')"
-echo "   Every step is monitored. If something fails, MiniMax-M2.7 will"
-echo "   diagnose the error and apply the fix automatically."
-echo
-
-# Try to load key from environment or existing .env
-if [ -z "$AI_FIX_KEY" ] && [ -f ".env" ]; then
-    AI_FIX_KEY="$(grep -oP 'ANTHROPIC_API_KEY=\K.*' .env 2>/dev/null || true)"
-fi
-
-if [ -n "$AI_FIX_KEY" ]; then
-    AI_FIX_ENABLED=1
-    ok "AI key loaded (model: $AI_FIX_MODEL)"
-else
-    echo "   You need a MiniMax API key for AI-guided install."
-    echo "   Get one at: $(color '1;36' 'https://platform.minimax.io/user-center/basic-information/interface-key')"
-    echo
-    read -rsp "   MiniMax API Key: " AI_FIX_KEY
-    echo
-    if [ -n "$AI_FIX_KEY" ]; then
-        AI_FIX_ENABLED=1
-        ok "AI guide enabled (model: $AI_FIX_MODEL)"
-    else
-        warn "No key — installing without AI guidance (errors won't be auto-fixed)"
-    fi
-fi
-
-# --- 2. Python version check ------------------------------------------------
+# --- 1. Python version check ------------------------------------------------
 step "Checking Python"
 ai_narrate "Checking that Python 3.11+ is installed and working"
 info "Checking Python..."
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     if [ "$IS_TERMUX" -eq 1 ]; then
-        err "python not found. Install it with: pkg install -y python"
+        ai_fail_exit "Python not found" \
+            "Termux detected. Fix: pkg install -y python   then re-run bash install.sh"
     else
-        err "python3 not found. Install Python 3.11+ and re-run."
+        ai_fail_exit "python3 not found" \
+            "Install Python 3.11+ for your distro and re-run."
     fi
-    exit 1
 fi
 if [ "$IS_TERMUX" -eq 1 ] && [ "$PYTHON_BIN" = "python" ]; then
     info "Termux detected — using 'python' instead of 'python3'"
@@ -935,35 +994,33 @@ PY_MAJOR=$($PYTHON_BIN -c 'import sys; print(sys.version_info[0])')
 PY_MINOR=$($PYTHON_BIN -c 'import sys; print(sys.version_info[1])')
 if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
     if [ "$IS_TERMUX" -eq 1 ]; then
-        err "Python >= 3.11 required (found $PY_VER)."
-        err "Update with: pkg upgrade -y python"
+        ai_fail_exit "Python >= 3.11 required (found $PY_VER)" \
+            "Termux: pkg upgrade -y python"
     else
-        err "Python >= 3.11 required (found $PY_VER)."
+        ai_fail_exit "Python >= 3.11 required (found $PY_VER)" \
+            "Upgrade Python to 3.11+ and re-run."
     fi
-    exit 1
 fi
 ok "Python $PY_VER ($([ "$IS_TERMUX" -eq 1 ] && echo 'Termux' || echo 'system'))"
 
-# --- 3. Preflight AI environment prep -------------------------------------
+# --- 2. Preflight AI environment prep -------------------------------------
 step "Preflight Environment Scan"
 ai_narrate "Scanning your system for missing build tools and libraries before we start installing"
 preflight_run
 
-# --- 4. venv ----------------------------------------------------------------
+# --- 3. venv ----------------------------------------------------------------
 step "Creating Virtual Environment"
 ai_narrate "Setting up an isolated Python environment so the bot's dependencies don't conflict with your system packages"
 if [ ! -d ".venv" ]; then
     info "Creating virtualenv at .venv ..."
     if ! run_with_ai_fix "create virtualenv" $PYTHON_BIN -m venv .venv; then
         if [ "$IS_TERMUX" -eq 1 ]; then
-            err "Could not create venv. Try:"
-            err "  pkg install -y python"
-            err "  (venv is bundled with the Termux python package)"
+            ai_fail_exit "Could not create venv" \
+                "Termux: pkg install -y python   (venv is bundled with the python package)"
         else
-            err "Could not create venv. On Debian/Ubuntu try:"
-            err "  sudo apt install python3-venv"
+            ai_fail_exit "Could not create venv" \
+                "Debian/Ubuntu: sudo apt install python3-venv"
         fi
-        exit 1
     fi
     ok "venv created"
 else
@@ -977,16 +1034,16 @@ step "Installing Dependencies"
 ai_narrate "Installing all Python packages the bot needs: Binance API client, pandas for data, telegram for alerts, AI SDK, and more. This is the longest step."
 info "Upgrading pip / setuptools / wheel..."
 if ! run_with_ai_fix "upgrade pip toolchain" pip install --upgrade pip setuptools wheel; then
-    err "pip toolchain upgrade failed."
-    exit 1
+    ai_fail_exit "pip toolchain upgrade failed" \
+        "Could not upgrade pip/setuptools/wheel inside the venv"
 fi
 info "Installing dependencies (this may take a minute)..."
 # --prefer-binary makes pip pick prebuilt wheels when available, avoiding
 # source builds for Rust-backed packages like `jiter` (an anthropic
 # transitive dep) on platforms where Rust/maturin isn't installed.
 if ! run_with_ai_fix "install requirements" pip install --prefer-binary -r requirements.txt; then
-    err "Dependency install failed. See the log above."
-    exit 1
+    ai_fail_exit "Dependency install failed" \
+        "pip install -r requirements.txt failed. Check the log above for the specific package."
 fi
 ok "dependencies installed"
 
