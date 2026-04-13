@@ -48,6 +48,33 @@ warn()  { echo "$(color '1;33' '[!]') $*"; }
 ok()    { echo "$(color '1;32' '[✓]') $*"; }
 err()   { echo "$(color '1;31' '[x]') $*" >&2; }
 
+# ---------- Termux detection -------------------------------------------------
+# Termux on Android has its own filesystem under /data/data/com.termux, no
+# sudo, no systemd, uses `pkg` as the package manager, and ships Python
+# without a separate python3-venv package (venv is bundled).
+IS_TERMUX=0
+TERMUX_PREFIX="${PREFIX:-}"
+if [[ "$TERMUX_PREFIX" == /data/data/com.termux* ]] || [ -d "/data/data/com.termux/files/usr" ]; then
+    IS_TERMUX=1
+    echo
+    info "$(color '1;35' 'Termux environment detected')"
+    echo "   If this is a fresh Termux install, run these first:"
+    echo "     pkg update -y && pkg upgrade -y"
+    echo "     pkg install -y python clang make rust binutils"
+    echo "     pkg install -y libffi openssl pkg-config git curl"
+    echo
+fi
+
+# Resolve PYTHON_BIN early so all helper functions can use it.
+# The Python version check later validates the version.
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+elif [ "$IS_TERMUX" -eq 1 ] && command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+else
+    PYTHON_BIN="python3"  # will fail at the version check with a clear error
+fi
+
 # --------------------------------------------------------------------------
 # AI-assisted install pipeline.
 #
@@ -156,7 +183,7 @@ _minimax_call() {
         return 1
     fi
 
-    RESP_FILE="$body_file" python3 - <<'PYEOF'
+    RESP_FILE="$body_file" $PYTHON_BIN - <<'PYEOF'
 import json, os, sys
 with open(os.environ["RESP_FILE"], "r", errors="replace") as f:
     raw = f.read()
@@ -213,7 +240,7 @@ PYEOF
 # Usage: _extract_json_obj "$text_var"
 # Stdout: extracted JSON object. Returns non-zero on failure.
 _extract_json_obj() {
-    _EXTRACT_INPUT="$1" python3 - <<'PYEOF'
+    _EXTRACT_INPUT="$1" $PYTHON_BIN - <<'PYEOF'
 import json, os, sys
 text = os.environ.get("_EXTRACT_INPUT", "").strip()
 if not text:
@@ -237,7 +264,7 @@ PYEOF
 
 # Collect a system snapshot for the preflight AI call. Pure Python stdlib.
 preflight_collect() {
-    python3 - <<'PYEOF'
+    $PYTHON_BIN - <<'PYEOF'
 import json, os, platform, shutil, subprocess
 
 def has(c):
@@ -341,7 +368,7 @@ preflight_run() {
     # Show the scan summary to the user. Use an env var (not stdin) so the
     # `python3 - <<'PYEOF'` heredoc isn't fighting a `< file` redirect for
     # Python's stdin.
-    INFO_FILE="$info_file" python3 - <<'PYEOF'
+    INFO_FILE="$info_file" $PYTHON_BIN - <<'PYEOF'
 import json, os
 with open(os.environ["INFO_FILE"]) as f:
     d = json.load(f)
@@ -362,7 +389,7 @@ PYEOF
 
     # Build the AI request.
     local payload
-    payload=$(INFO_FILE="$info_file" AI_MODEL_ENV="$AI_FIX_MODEL" python3 - <<'PYEOF'
+    payload=$(INFO_FILE="$info_file" AI_MODEL_ENV="$AI_FIX_MODEL" $PYTHON_BIN - <<'PYEOF'
 import json, os
 with open(os.environ["INFO_FILE"]) as f:
     info = json.load(f)
@@ -434,10 +461,10 @@ PYEOF
     fi
 
     local diag cmds
-    diag=$(printf '%s' "$plan" | python3 -c \
+    diag=$(printf '%s' "$plan" | $PYTHON_BIN -c \
         'import sys,json;print(json.load(sys.stdin).get("diagnosis",""))' \
         2>/dev/null || echo "")
-    cmds=$(printf '%s' "$plan" | python3 -c \
+    cmds=$(printf '%s' "$plan" | $PYTHON_BIN -c \
 'import sys,json
 obj = json.load(sys.stdin)
 for c in obj.get("setup_commands", []) or []:
@@ -494,7 +521,7 @@ ai_fix_suggest() {
 
     local payload
     payload=$(AI_STEP="$step" AI_CMD="$cmd" AI_RC="$rc" AI_LOG_FILE="$log" \
-              AI_MODEL_ENV="$AI_FIX_MODEL" python3 - <<'PYEOF'
+              AI_MODEL_ENV="$AI_FIX_MODEL" IS_TERMUX="$IS_TERMUX" $PYTHON_BIN - <<'PYEOF'
 import json, os, platform
 log_path = os.environ["AI_LOG_FILE"]
 try:
@@ -511,6 +538,8 @@ user_msg = {
     "os": platform.platform(),
     "python_version": platform.python_version(),
     "cwd": os.getcwd(),
+    "is_termux": os.environ.get("IS_TERMUX", "0") == "1",
+    "termux_prefix": os.environ.get("PREFIX", ""),
 }
 
 system = (
@@ -521,8 +550,15 @@ system = (
     "Rules:\n"
     "- Never suggest destructive commands (rm -rf /, mkfs, dd, shutdown, "
     "reboot, curl | sh from unknown hosts, chmod 777 on system dirs).\n"
-    "- Prefer apt/yum/dnf/apk install with sudo when a system dep is "
-    "missing, or pip install inside the existing venv for Python packages.\n"
+    "- If `is_termux` is true: this is Android Termux. Use `pkg install -y "
+    "<name>` (NOT apt-get), do NOT use sudo (Termux has no root). Termux "
+    "package names: `python` (not python3), `python-pip`, `clang` (for C "
+    "compiler), `make`, `binutils`, `libffi`, `openssl`, `rust` (for "
+    "rustc/cargo), `pkg-config`. There is no python3-venv package — venv "
+    "is bundled with the `python` package.\n"
+    "- Otherwise: prefer apt/yum/dnf/apk install with sudo when a system "
+    "dep is missing.\n"
+    "- Or pip install inside the existing venv for Python packages.\n"
     "- Keep the fix minimal (1-4 commands).\n"
     "- If you cannot confidently fix it, return fix_commands=[] and "
     "retry=false.\n\n"
@@ -594,13 +630,13 @@ run_with_ai_fix() {
         rm -f "$log"
 
         local diag retry cmds
-        diag=$(printf '%s' "$suggestion" | python3 -c \
+        diag=$(printf '%s' "$suggestion" | $PYTHON_BIN -c \
             'import sys,json;print(json.load(sys.stdin).get("diagnosis",""))' \
             2>/dev/null || echo "")
-        retry=$(printf '%s' "$suggestion" | python3 -c \
+        retry=$(printf '%s' "$suggestion" | $PYTHON_BIN -c \
             'import sys,json;print("yes" if json.load(sys.stdin).get("retry", True) else "no")' \
             2>/dev/null || echo "yes")
-        cmds=$(printf '%s' "$suggestion" | python3 -c \
+        cmds=$(printf '%s' "$suggestion" | $PYTHON_BIN -c \
 'import sys,json
 obj = json.load(sys.stdin)
 for c in obj.get("fix_commands", []) or []:
@@ -653,19 +689,31 @@ for c in obj.get("fix_commands", []) or []:
 
 # --- 1. Python version check ------------------------------------------------
 info "Checking Python..."
-if ! command -v python3 >/dev/null 2>&1; then
-    err "python3 not found. Install Python 3.11+ and re-run."
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    if [ "$IS_TERMUX" -eq 1 ]; then
+        err "python not found. Install it with: pkg install -y python"
+    else
+        err "python3 not found. Install Python 3.11+ and re-run."
+    fi
     exit 1
+fi
+if [ "$IS_TERMUX" -eq 1 ] && [ "$PYTHON_BIN" = "python" ]; then
+    info "Termux detected — using 'python' instead of 'python3'"
 fi
 
-PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info[0])')
-PY_MINOR=$(python3 -c 'import sys; print(sys.version_info[1])')
+PY_VER=$($PYTHON_BIN -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+PY_MAJOR=$($PYTHON_BIN -c 'import sys; print(sys.version_info[0])')
+PY_MINOR=$($PYTHON_BIN -c 'import sys; print(sys.version_info[1])')
 if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
-    err "Python >= 3.11 required (found $PY_VER)."
+    if [ "$IS_TERMUX" -eq 1 ]; then
+        err "Python >= 3.11 required (found $PY_VER)."
+        err "Update with: pkg upgrade -y python"
+    else
+        err "Python >= 3.11 required (found $PY_VER)."
+    fi
     exit 1
 fi
-ok "Python $PY_VER"
+ok "Python $PY_VER ($([ "$IS_TERMUX" -eq 1 ] && echo 'Termux' || echo 'system'))"
 
 # --- 1.5 AI-assisted error recovery opt-in ---------------------------------
 if [ "$AI_FIX_CLI" -eq 1 ]; then
@@ -718,9 +766,15 @@ preflight_run
 # --- 2. venv ----------------------------------------------------------------
 if [ ! -d ".venv" ]; then
     info "Creating virtualenv at .venv ..."
-    if ! run_with_ai_fix "create virtualenv" python3 -m venv .venv; then
-        err "Could not create venv. On Debian/Ubuntu try:"
-        err "  sudo apt install python3-venv"
+    if ! run_with_ai_fix "create virtualenv" $PYTHON_BIN -m venv .venv; then
+        if [ "$IS_TERMUX" -eq 1 ]; then
+            err "Could not create venv. Try:"
+            err "  pkg install -y python"
+            err "  (venv is bundled with the Termux python package)"
+        else
+            err "Could not create venv. On Debian/Ubuntu try:"
+            err "  sudo apt install python3-venv"
+        fi
         exit 1
     fi
     ok "venv created"
@@ -829,10 +883,10 @@ ok "logs/ and state/ directories ready"
 
 # --- 7. smoke-check imports ------------------------------------------------
 info "Verifying imports..."
-if python3 -c "import src.config, src.bot, src.exchange.simulator, src.strategy.ai_strategy" 2>/dev/null; then
+if $PYTHON_BIN -c "import src.config, src.bot, src.exchange.simulator, src.strategy.ai_strategy" 2>/dev/null; then
     ok "imports OK"
 else
-    warn "import check failed — run 'python3 -c \"import src.bot\"' to debug"
+    warn "import check failed — run '$PYTHON_BIN -c \"import src.bot\"' to debug"
 fi
 
 # --- 8. optional connectivity check ----------------------------------------
@@ -844,7 +898,7 @@ if [ -f ".env" ]; then
             # shellcheck disable=SC1091
             set -a; source .env; set +a
             info "Pinging Binance Futures..."
-            python3 - <<'PYEOF' || warn "Binance ping failed"
+            $PYTHON_BIN - <<'PYEOF' || warn "Binance ping failed"
 import asyncio, os
 try:
     from binance import AsyncClient
@@ -880,7 +934,7 @@ PYEOF
 
             if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
                 info "Checking MiniMax (Anthropic-compatible) API..."
-                python3 - <<'PYEOF' || warn "MiniMax API check failed"
+                $PYTHON_BIN - <<'PYEOF' || warn "MiniMax API check failed"
 import os
 try:
     from anthropic import Anthropic
@@ -906,7 +960,38 @@ PYEOF
     esac
 fi
 
-cat <<'EOF'
+if [ "$IS_TERMUX" -eq 1 ]; then
+    cat <<'EOF'
+
+──────────────────────────────────────────────
+ ✅ Install complete (Termux).
+
+ Next steps:
+
+   ./run.sh                # runs in mode from .env (defaults to sim)
+   ./run.sh --mode sim     # force simulation (paper trading, no real orders)
+   ./run.sh --mode live    # real orders on Binance Futures
+
+ Termux tips:
+   • Acquire a wakelock so Android doesn't kill the bot:
+       termux-wake-lock
+   • Run in background with tmux or nohup:
+       pkg install -y tmux
+       tmux new -s bot './run.sh'
+       (Ctrl+B, D to detach — tmux attach -t bot to reconnect)
+   • Or use nohup:
+       nohup ./run.sh > bot.log 2>&1 &
+   • To stop: kill %1  or  tmux kill-session -t bot
+   • If pip install fails with build errors, try:
+       pkg install -y clang make rust binutils libffi openssl pkg-config
+       then re-run ./install.sh
+
+ Edit strategy parameters:  config.yaml
+ Edit credentials:          .env
+──────────────────────────────────────────────
+EOF
+else
+    cat <<'EOF'
 
 ──────────────────────────────────────────────
  ✅ Install complete.
@@ -921,3 +1006,4 @@ cat <<'EOF'
  Edit credentials:          .env
 ──────────────────────────────────────────────
 EOF
+fi
