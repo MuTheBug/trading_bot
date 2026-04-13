@@ -871,11 +871,11 @@ for c in obj.get("fix_commands", []) or []:
 # ---------- Run update mode if requested (after all functions are defined) ---
 if [ "$UPDATE_MODE" -eq 1 ]; then
     # Load AI key from .env if available for update summary
-    if [ -f ".env" ]; then
+    if [ -z "$AI_FIX_KEY" ] && [ -f ".env" ]; then
         AI_FIX_KEY="${ANTHROPIC_API_KEY:-$(grep -oP 'ANTHROPIC_API_KEY=\K.*' .env 2>/dev/null || true)}"
-        if [ -n "$AI_FIX_KEY" ] && [ "$AI_FIX_CLI" -eq 1 ]; then
-            AI_FIX_ENABLED=1
-        fi
+    fi
+    if [ -n "$AI_FIX_KEY" ]; then
+        AI_FIX_ENABLED=1
     fi
     do_update
 fi
@@ -884,7 +884,37 @@ fi
 # FULL INSTALL FLOW
 # ===========================================================================
 
-# --- 1. Python version check ------------------------------------------------
+# --- 1. AI-Guided Install (ask for key FIRST so all steps get AI help) ------
+step "AI-Guided Install"
+echo
+info "$(color '1;35' 'This installer uses AI to guide you and auto-fix errors.')"
+echo "   Every step is monitored. If something fails, MiniMax-M2.7 will"
+echo "   diagnose the error and apply the fix automatically."
+echo
+
+# Try to load key from environment or existing .env
+if [ -z "$AI_FIX_KEY" ] && [ -f ".env" ]; then
+    AI_FIX_KEY="$(grep -oP 'ANTHROPIC_API_KEY=\K.*' .env 2>/dev/null || true)"
+fi
+
+if [ -n "$AI_FIX_KEY" ]; then
+    AI_FIX_ENABLED=1
+    ok "AI key loaded (model: $AI_FIX_MODEL)"
+else
+    echo "   You need a MiniMax API key for AI-guided install."
+    echo "   Get one at: $(color '1;36' 'https://platform.minimax.io/user-center/basic-information/interface-key')"
+    echo
+    read -rsp "   MiniMax API Key: " AI_FIX_KEY
+    echo
+    if [ -n "$AI_FIX_KEY" ]; then
+        AI_FIX_ENABLED=1
+        ok "AI guide enabled (model: $AI_FIX_MODEL)"
+    else
+        warn "No key — installing without AI guidance (errors won't be auto-fixed)"
+    fi
+fi
+
+# --- 2. Python version check ------------------------------------------------
 step "Checking Python"
 ai_narrate "Checking that Python 3.11+ is installed and working"
 info "Checking Python..."
@@ -914,53 +944,7 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }
 fi
 ok "Python $PY_VER ($([ "$IS_TERMUX" -eq 1 ] && echo 'Termux' || echo 'system'))"
 
-# --- 2. AI-assisted error recovery opt-in ---------------------------------
-step "AI-Assisted Setup"
-if [ "$AI_FIX_CLI" -eq 1 ]; then
-    if [ -z "$AI_FIX_KEY" ]; then
-        echo
-        info "AI auto-fix enabled via --ai-fix"
-        read -rsp "   MiniMax API Key (for auto-fix): " AI_FIX_KEY
-        echo
-    fi
-    if [ -n "$AI_FIX_KEY" ]; then
-        AI_FIX_ENABLED=1
-        ok "AI auto-fix enabled (model: $AI_FIX_MODEL)"
-    else
-        warn "No API key supplied — AI auto-fix disabled"
-    fi
-else
-    echo
-    info "AI-assisted error recovery"
-    echo "   When a step fails (e.g. 'python3 -m venv' missing python3-venv,"
-    echo "   or 'pip install' missing a system library), the installer can"
-    echo "   send the error log to MiniMax-M2.7 and apply the fix it proposes."
-    echo "   Every command is shown before it runs; nothing executes without"
-    echo "   your approval."
-    read -rp "   Enable AI auto-fix? [y/N]: " USE_AI_FIX
-    case "${USE_AI_FIX:-}" in
-        y|Y|yes|YES)
-            if [ -z "$AI_FIX_KEY" ]; then
-                read -rsp "   MiniMax API Key (for auto-fix): " AI_FIX_KEY
-                echo
-            fi
-            if [ -n "$AI_FIX_KEY" ]; then
-                AI_FIX_ENABLED=1
-                ok "AI auto-fix enabled (model: $AI_FIX_MODEL)"
-            else
-                warn "No API key supplied — AI auto-fix disabled"
-            fi
-            ;;
-        *) ;;
-    esac
-fi
-
 # --- 3. Preflight AI environment prep -------------------------------------
-# If AI auto-fix is enabled, collect an OS/toolchain snapshot, send it to
-# MiniMax-M2.7, and auto-apply whatever setup commands it suggests BEFORE we
-# try to build the venv / install requirements. This catches classic missing
-# deps (python3-venv on Debian, build tools on RHEL, rustc for jiter on
-# arches without prebuilt wheels) before they turn into failed retries.
 step "Preflight Environment Scan"
 ai_narrate "Scanning your system for missing build tools and libraries before we start installing"
 preflight_run
