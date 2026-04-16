@@ -24,8 +24,8 @@ class TrendMomentumStrategy(Strategy):
     def __init__(self, cfg: StrategyConfig) -> None:
         self.cfg = cfg
 
-    def evaluate(
-        self, df15: pd.DataFrame, df1h: pd.DataFrame
+    async def evaluate(
+        self, symbol: str, df15: pd.DataFrame, df1h: pd.DataFrame
     ) -> Optional[Signal]:
         c = self.cfg
         min_bars = max(c.ema_slow, c.adx_period, c.rsi_period, c.atr_period, c.volume_sma_period) + 5
