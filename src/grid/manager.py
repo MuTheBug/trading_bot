@@ -449,54 +449,170 @@ class GridManager:
         return mark_price < gs.lower_price - margin or mark_price > gs.upper_price + margin
 
     async def close_net_position(self) -> float:
-        """Market-close the net inventory so we don't leave a naked position.
+        """Market-close whatever the exchange actually holds for this symbol.
 
-        Returns the realized PnL recognised by the close (gross of fees).
+        Previously trusted ``gs.net_qty``. If our tracking drifted below
+        the real position (async fills mid-teardown, restart mid-trade,
+        partial fills), the trusted path would close only part of the
+        position and force-zero the state, leaving a naked bag on the
+        exchange. Now we query exchange truth, close it, re-query to
+        verify, and retry up to twice for residuals.
+
+        Returns net realized PnL (gross of state tracking — used for logs).
         """
         gs = self.grid
-        if abs(gs.net_qty) < 1e-12 or not gs.symbol:
+        if not gs.symbol:
             return 0.0
 
         symbol = gs.symbol
-        qty = abs(gs.net_qty)
-        side = "SELL" if gs.net_qty > 0 else "BUY"
 
-        try:
-            result = await self.exchange.market_close(symbol, side, qty)
-        except Exception as e:
-            # Fallback: some exchanges need market_open with reduce_only off
-            logger.warning("market_close failed ({}), trying market_open: {}", side, e)
+        realized_total = 0.0
+        fee_total = 0.0
+        last_fill_price = 0.0
+
+        for attempt in range(3):
+            real_qty, real_side = await self._exchange_position(symbol)
+
+            # If the exchange shows flat but we still think we have
+            # inventory, trust the exchange and clear tracking.
+            if real_qty <= 1e-12:
+                break
+
+            close_side = "SELL" if real_side == "LONG" else "BUY"
             try:
-                result = await self.exchange.market_open(symbol, side, qty)
-            except Exception as e2:
-                logger.error("Failed to close net position: {}", e2)
-                return 0.0
+                result = await self.exchange.market_close(
+                    symbol, close_side, real_qty,
+                )
+            except Exception as e:
+                logger.warning(
+                    "market_close failed ({} {} {}) — trying market_open fallback: {}",
+                    symbol, close_side, real_qty, e,
+                )
+                try:
+                    result = await self.exchange.market_open(
+                        symbol, close_side, real_qty,
+                    )
+                except Exception as e2:
+                    logger.error(
+                        "Failed to close {} position on {}: {}", real_side, symbol, e2,
+                    )
+                    trade_log.log(
+                        "close_fail", s=symbol, sd=close_side[0],
+                        q=real_qty, why=str(e2)[:120],
+                    )
+                    # Leave tracking alone — better to know there's a
+                    # naked position than silently zero it.
+                    return 0.0
 
-        fill_price = result.avg_price or 0.0
-        fee = result.fee or (fill_price * qty * _MAKER_FEE * 2)  # fallback taker-ish
-        if fill_price <= 0:
-            # Can't price — just zero out tracking
-            realized = 0.0
+            fill_price = result.avg_price or last_fill_price or gs.avg_entry
+            last_fill_price = fill_price or last_fill_price
+            fee = result.fee or (fill_price * real_qty * _MAKER_FEE * 2)
+
+            # Realized PnL uses the tracked avg_entry as cost basis. If
+            # tracking was already stale this is approximate, but better
+            # than nothing — and it's logged so the AI can see it.
+            if fill_price > 0:
+                realized_total += self._realized_pnl(close_side, fill_price, real_qty)
+            fee_total += fee
+
+            # Reflect the close in tracking
+            self._update_net_position(
+                fill_price or gs.avg_entry, real_qty, close_side,
+            )
+
+            logger.info(
+                "[GRID] Close attempt {}: {} {:.8f} @ {:.8f} on {} "
+                "(realized~{:+.5f} fee={:.5f})",
+                attempt + 1, close_side, real_qty, fill_price, symbol,
+                realized_total - fee_total, fee,
+            )
+
+        # Verify we really are flat
+        real_qty, _ = await self._exchange_position(symbol)
+        if real_qty > 1e-8:
+            logger.error(
+                "[GRID] After close attempts, {:.8f} qty still open on {}. "
+                "Flagging for manual review.", real_qty, symbol,
+            )
+            trade_log.log("close_fail", s=symbol, q=real_qty, why="residual")
         else:
-            realized = self._realized_pnl(side, fill_price, qty)
-        self._update_net_position(fill_price or gs.avg_entry, qty, side)
-        # Safety: force to zero since we just closed all of it
-        gs.net_qty = 0.0
-        gs.avg_entry = 0.0
+            gs.net_qty = 0.0
+            gs.avg_entry = 0.0
 
-        net_realized = realized - fee
-        logger.info(
-            "[GRID] Closed naked position: {} {} @ {:.8f} realized={:+.5f} fee={:.5f}",
-            side, qty, fill_price, net_realized, fee,
-        )
-        trade_log.log(
-            "close", s=symbol, sd=("S" if side == "SELL" else "B"),
-            p=fill_price, q=qty, pnl=net_realized, why="teardown",
-        )
-        if realized != 0.0 or fee != 0.0:
-            self.state.record_grid_fill(net_realized, fee)
+        net_realized = realized_total - fee_total
+        if abs(net_realized) > 1e-12 or fee_total > 0:
+            trade_log.log(
+                "close", s=symbol, p=last_fill_price, q=abs(gs.net_qty) or 0.0,
+                pnl=net_realized, why="teardown",
+            )
+            # Record the PnL into daily/grid stats
+            if abs(realized_total) > 1e-12 or fee_total > 0:
+                self.state.record_grid_fill(net_realized, fee_total)
         self.state.save()
         return net_realized
+
+    async def _exchange_position(self, symbol: str) -> Tuple[float, str]:
+        """Return (abs_qty, side) for the real exchange position on ``symbol``.
+
+        ``side`` is "LONG" or "SHORT"; qty is 0 if flat.
+        """
+        try:
+            positions = await self.exchange.get_open_positions()
+        except Exception as e:
+            logger.warning("get_open_positions failed on {}: {}", symbol, e)
+            # Fall back to tracked net_qty
+            gs = self.grid
+            if abs(gs.net_qty) < 1e-12:
+                return 0.0, "LONG"
+            return abs(gs.net_qty), "LONG" if gs.net_qty > 0 else "SHORT"
+        for p in positions:
+            if p.symbol == symbol and p.qty > 1e-12:
+                return p.qty, p.side
+        return 0.0, "LONG"
+
+    async def reconcile_positions(self) -> int:
+        """Close any orphaned positions on the account.
+
+        Called on startup to guarantee a flat slate — if the previous
+        session crashed mid-teardown (or left a naked bag during a
+        take-profit trip) the position sits open and new grids stack on
+        top of it. This sweeps it.
+
+        Returns the number of symbols that had residual positions closed.
+        """
+        try:
+            positions = await self.exchange.get_open_positions()
+        except Exception as e:
+            logger.warning("reconcile_positions: get_open_positions failed: {}", e)
+            return 0
+        closed = 0
+        for p in positions:
+            if p.qty < 1e-12:
+                continue
+            close_side = "SELL" if p.side == "LONG" else "BUY"
+            logger.warning(
+                "Orphaned {} position on {}: qty={:.8f} entry={:.8f} — closing",
+                p.side, p.symbol, p.qty, p.entry_price,
+            )
+            try:
+                await self.exchange.market_close(p.symbol, close_side, p.qty)
+                trade_log.log(
+                    "reconcile", s=p.symbol, sd=close_side[0],
+                    q=p.qty, ae=p.entry_price,
+                )
+                closed += 1
+            except Exception as e:
+                logger.error("Failed to close orphan on {}: {}", p.symbol, e)
+                try:
+                    await self.exchange.market_open(p.symbol, close_side, p.qty)
+                    closed += 1
+                except Exception as e2:
+                    logger.error("Fallback close also failed on {}: {}", p.symbol, e2)
+                    trade_log.log(
+                        "close_fail", s=p.symbol, q=p.qty,
+                        why=f"reconcile:{str(e2)[:80]}",
+                    )
+        return closed
 
     async def teardown(self, close_position: bool = True) -> None:
         """Cancel all grid orders and deactivate.

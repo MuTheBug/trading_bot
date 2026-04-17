@@ -218,6 +218,51 @@ def test_compute_grid_params_min_spacing_respected():
     assert decision.spacing >= min_spacing * 0.99  # allow tiny float imprecision
 
 
+def test_compute_grid_params_scales_qty_to_capital_cap():
+    """Previously the solver always picked the minimum qty that met
+    min_notional, so with a $10 DOGEUSDT grid each round trip yielded
+    sub-cent profits. The fix scales qty UP to the capital cap.
+    """
+    ticker = TickerInfo(
+        "DOGEUSDT", price=0.15, volume_24h=200_000_000,
+        change_pct_24h=2.5, high_24h=0.155, low_24h=0.145,
+    )
+    filters = SymbolFilters("DOGEUSDT", 0.00001, 1.0, 1.0, 5.0)
+    decision = compute_grid_params(
+        price=0.15, ticker=ticker, filters=filters, balance=10.0,
+        max_leverage=10, max_grids=15, min_grids=3, max_capital_pct=75.0,
+    )
+    assert decision is not None
+    # Floor qty (min_notional at lower_price, rounded up to step) is 1.
+    # New solver should pick >> 1 to use the $7.50 margin budget.
+    assert decision.qty_per_grid > 10, (
+        f"qty {decision.qty_per_grid} is still near the min_notional floor"
+    )
+    # And the full-cycle profit should be meaningful (>1% of balance)
+    total_trip_profit = decision.num_grids * decision.profit_per_trip
+    assert total_trip_profit > 0.10, (
+        f"total trip profit {total_trip_profit:.4f} is < 1% of balance"
+    )
+
+
+def test_compute_grid_params_respects_capital_cap():
+    """Total margin must stay under max_capital_pct of balance."""
+    ticker = TickerInfo(
+        "DOGEUSDT", price=0.15, volume_24h=200_000_000,
+        change_pct_24h=2.5, high_24h=0.155, low_24h=0.145,
+    )
+    filters = SymbolFilters("DOGEUSDT", 0.00001, 1.0, 1.0, 5.0)
+    decision = compute_grid_params(
+        price=0.15, ticker=ticker, filters=filters, balance=10.0,
+        max_leverage=10, max_grids=15, min_grids=3, max_capital_pct=50.0,
+    )
+    assert decision is not None
+    avg_price = (decision.upper_price + decision.lower_price) / 2
+    total_margin = decision.num_grids * decision.qty_per_grid * avg_price / decision.leverage
+    # Allow 2% headroom for step rounding
+    assert total_margin <= 10.0 * 0.50 * 1.02
+
+
 # ---- Rebalance (math-based) ----
 
 def test_compute_rebalance_returns_new_params():

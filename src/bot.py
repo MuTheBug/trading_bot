@@ -107,12 +107,25 @@ class TradingBot:
             await self._cleanup_stale_orders(self.state.state.grid.symbol)
             self.state.state.grid.active = False
             self.state.state.grid.levels.clear()
+            self.state.state.grid.net_qty = 0.0
+            self.state.state.grid.avg_entry = 0.0
             self.state.save()
         elif self.state.state.grid.symbol:
             # No active grid but a previous symbol is remembered — make sure
             # no stray orders are still sitting on the exchange (e.g. the bot
             # crashed mid-teardown).
             await self._cleanup_stale_orders(self.state.state.grid.symbol)
+
+        # Close any orphaned positions ACROSS THE WHOLE ACCOUNT. If the
+        # previous session lost a position during a TP or stop (or the
+        # user fat-fingered a manual trade), it would otherwise sit
+        # bleeding while a new grid stacks on top.
+        try:
+            closed = await self.grid_manager.reconcile_positions()
+            if closed:
+                logger.warning("Reconciled {} orphaned position(s) on startup", closed)
+        except Exception as e:
+            logger.warning("Startup reconcile failed: {}", e)
 
         equity = await self.get_equity()
         if self.state.state.peak_equity < equity:
@@ -427,6 +440,18 @@ class TradingBot:
         """Scan symbols, let AI pick one, compute grid params, set up the grid."""
         logger.info("Scanning symbols for grid trading...")
         await self.telegram.send("\U0001f50d Scanning symbols for grid trading...")
+
+        # Belt-and-suspenders: before we commit to a new grid, make sure
+        # no residual position is sitting open on any symbol. This closes
+        # the "TP leaves a bag, next grid stacks on top" bug class.
+        try:
+            closed = await self.grid_manager.reconcile_positions()
+            if closed:
+                logger.warning(
+                    "Pre-setup reconcile closed {} orphan position(s)", closed,
+                )
+        except Exception as e:
+            logger.warning("Pre-setup reconcile failed: {}", e)
 
         try:
             # 1. Fetch all tickers and filters

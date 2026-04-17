@@ -384,6 +384,54 @@ async def test_teardown_closes_naked_position():
     assert not gm.active
 
 
+@pytest.mark.asyncio
+async def test_close_uses_exchange_truth_when_tracking_is_stale():
+    """close_net_position must close what the EXCHANGE actually holds,
+    even if gs.net_qty is stale/wrong — otherwise the take-profit path
+    leaves a bag open while state thinks it's closed.
+    """
+    sim = FakeSim(price=0.15)
+    await sim.connect()
+    store = StateStore("/tmp/test_grid_close_truth.json")
+    gm = GridManager(sim, store)
+    filters = _make_filters()
+
+    await gm.setup_grid(_make_params(), filters, current_price=0.15)
+    gs = gm.grid
+
+    # State tracking under-reports: says we're flat...
+    gs.net_qty = 0.0
+    gs.avg_entry = 0.0
+    store.save()
+
+    # ...but the exchange has a real 30-qty long.
+    await sim.market_open("DOGEUSDT", "BUY", 30.0)
+
+    await gm.close_net_position()
+
+    # Afterwards, BOTH sides should be flat.
+    positions = await sim.get_open_positions()
+    assert all(p.symbol != "DOGEUSDT" or p.qty < 1e-9 for p in positions)
+    assert gm.grid.net_qty == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_closes_orphan_positions():
+    """reconcile_positions must sweep up positions left on the account."""
+    sim = FakeSim(price=0.15)
+    await sim.connect()
+    store = StateStore("/tmp/test_grid_reconcile.json")
+    gm = GridManager(sim, store)
+
+    # Plant an orphan — imagine the bot crashed mid-teardown
+    await sim.market_open("DOGEUSDT", "BUY", 25.0)
+    assert len(await sim.get_open_positions()) == 1
+
+    closed = await gm.reconcile_positions()
+    assert closed == 1
+    assert len(await sim.get_open_positions()) == 0
+
+
 # ---- Grid summary ----
 
 @pytest.mark.asyncio

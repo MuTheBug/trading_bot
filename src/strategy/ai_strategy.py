@@ -136,15 +136,22 @@ def compute_grid_params(
     max_leverage: int,
     max_grids: int,
     min_grids: int,
-    max_capital_pct: float = 40.0,
+    max_capital_pct: float = 75.0,
 ) -> Optional[GridDecision]:
     """Compute grid parameters mathematically — no AI involved.
 
-    The grid is centered on the current price. Width is based on
-    recent 24h range (use ~40% of it to stay safely inside).
-    Spacing is set to guarantee profit after fees. Total margin
-    is capped at ``max_capital_pct`` of ``balance`` so a one-way
-    move can't drain the whole account.
+    Profitability strategy: previous version always picked the SMALLEST
+    qty that met min_notional and then stopped at the LOWEST leverage
+    that fit. Result: with a $10 balance on a $0.04 symbol, each trip
+    netted ~$0.000004 — below the rounding error of the exchange.
+
+    New approach:
+      1. Pick the HIGHEST allowed leverage (bigger qty for same margin)
+      2. Scale qty UP to use the full ``max_capital_pct`` capital budget
+      3. Round down to lot step, never below min_qty / min_notional
+
+    With per-tick 2% stop-loss, 10x leverage caps max loss at ~20% of
+    margin = ~15% of equity at 75% cap — acceptable with tight stops.
     """
     if price <= 0 or balance <= 0:
         return None
@@ -152,25 +159,24 @@ def compute_grid_params(
     tick = filters.price_tick
     step = filters.qty_step
 
-    # --- 1. Compute minimum profitable spacing ---
+    # --- 1. Minimum profitable spacing (fee-multiple above maker fee) ---
     min_spacing = price * 2 * MAKER_FEE * MIN_FEE_MULT
-    min_spacing = max(min_spacing, tick * 2)  # at least 2 ticks
+    min_spacing = max(min_spacing, tick * 2)
 
-    # --- 2. Compute grid range from 24h volatility ---
+    # --- 2. Grid width from 24h volatility ---
     range_24h = ticker.high_24h - ticker.low_24h
     if range_24h <= 0:
         range_24h = price * 0.02  # fallback: 2%
 
-    # Use 40% of 24h range as the grid width — conservative, keeps price
-    # inside the grid most of the time even on follow-through moves.
+    # 40% of 24h range — keeps most movements inside the grid while
+    # giving enough oscillation room to catch round trips.
     grid_width = range_24h * 0.40
     grid_width = max(grid_width, min_spacing * min_grids)
 
-    # --- 3. Compute number of grids ---
+    # --- 3. Number of grids ---
     num_grids = int(grid_width / min_spacing)
     num_grids = max(min_grids, min(num_grids, max_grids))
 
-    # Recalculate actual spacing
     spacing = grid_width / num_grids
     if spacing < min_spacing:
         spacing = min_spacing
@@ -180,93 +186,93 @@ def compute_grid_params(
     if spacing < tick:
         spacing = tick
 
-    # --- 4. Compute grid bounds centered on price ---
+    # --- 4. Grid bounds centered on price ---
     half_width = (spacing * num_grids) / 2
     lower_price = round_price(price - half_width, tick)
     upper_price = round_price(price + half_width, tick)
-
     if lower_price <= 0:
         lower_price = tick
         upper_price = round_price(lower_price + spacing * num_grids, tick)
 
-    # --- 5. Compute qty and leverage ---
-    # Hard cap on margin usage — this is the single biggest safeguard
-    # against "whole account in one losing position". A balance-draining
-    # directional move can at worst consume this fraction of equity.
-    max_margin = balance * (max_capital_pct / 100.0)
     avg_price = (upper_price + lower_price) / 2
+    max_margin = balance * (max_capital_pct / 100.0)
 
-    # Prefer lower leverage for less liquidation risk.
-    chosen = None
-    for leverage in [2, 3, 5, 8, 10, 15, max_leverage]:
-        if leverage > max_leverage:
-            leverage = max_leverage
+    # --- 5. Leverage + qty ---
+    # Use the MAX leverage allowed. Higher leverage means the same margin
+    # budget funds a bigger qty — which scales profit linearly. With a
+    # 2% hard stop-loss that triggers per-tick, runaway drawdowns are
+    # bounded at 2% * leverage of margin, so the leverage ladder now
+    # aggressively uses the configured cap.
+    leverage = max(1, max_leverage)
 
-        min_qty_for_notional = (
-            filters.min_notional / lower_price if lower_price > 0 else filters.min_qty
-        )
-        min_qty_for_notional = math.ceil(min_qty_for_notional / step) * step
-        qty = max(min_qty_for_notional, filters.min_qty)
+    # Floor: smallest qty that meets both min_qty and min_notional
+    min_qty_for_notional = (
+        filters.min_notional / lower_price if lower_price > 0 else filters.min_qty
+    )
+    min_qty_for_notional = math.ceil(min_qty_for_notional / step) * step
+    qty_floor = max(min_qty_for_notional, filters.min_qty)
 
-        total_margin = num_grids * qty * avg_price / leverage
+    # Ceiling: the biggest qty where total_margin still fits
+    # total_margin = num_grids * qty * avg_price / leverage <= max_margin
+    qty_ceiling = max_margin * leverage / (num_grids * avg_price)
+    qty_ceiling = math.floor(qty_ceiling / step) * step
 
-        if total_margin <= max_margin:
-            chosen = (leverage, qty)
-            break
-
-    if chosen is None:
-        # Even at max leverage we can't fit — shrink num_grids instead
-        # of blowing through the capital cap.
-        leverage = max_leverage
-        min_qty_for_notional = (
-            filters.min_notional / lower_price if lower_price > 0 else filters.min_qty
-        )
-        qty = max(math.ceil(min_qty_for_notional / step) * step, filters.min_qty)
-        margin_per_grid = qty * avg_price / leverage
-        if margin_per_grid <= 0:
+    if qty_ceiling < qty_floor:
+        # Even the smallest viable qty exceeds budget — try shrinking
+        # num_grids so capital goes further (at min qty the cheapest
+        # config is the one with the fewest levels).
+        shrunk = False
+        for n in range(num_grids - 1, min_grids - 1, -1):
+            qc = max_margin * leverage / (n * avg_price)
+            qc = math.floor(qc / step) * step
+            if qc >= qty_floor:
+                num_grids = n
+                grid_width = spacing * num_grids
+                half_width = grid_width / 2
+                lower_price = round_price(price - half_width, tick)
+                upper_price = round_price(price + half_width, tick)
+                if lower_price <= 0:
+                    lower_price = tick
+                    upper_price = round_price(lower_price + spacing * num_grids, tick)
+                avg_price = (upper_price + lower_price) / 2
+                qty_ceiling = qc
+                shrunk = True
+                break
+        if not shrunk:
             return None
-        num_grids = int(max_margin / margin_per_grid)
-        if num_grids < min_grids:
-            # Not enough capital for even the smallest viable grid
-            return None
-        num_grids = min(num_grids, max_grids)
-        grid_width = spacing * num_grids
-        half_width = grid_width / 2
-        lower_price = round_price(price - half_width, tick)
-        upper_price = round_price(price + half_width, tick)
-        avg_price = (upper_price + lower_price) / 2
-    else:
-        leverage, qty = chosen
 
+    # Take the largest qty that fits — this is the profit multiplier.
+    qty = max(qty_ceiling, qty_floor)
     qty = round_qty(qty, step)
     if qty < filters.min_qty:
         qty = filters.min_qty
 
-    # Final validation
+    # --- 6. Final validation ---
     if lower_price * qty < filters.min_notional:
         return None
-    if upper_price <= lower_price:
-        return None
-    if num_grids < min_grids:
+    if upper_price <= lower_price or num_grids < min_grids:
         return None
 
-    # --- 6. Calculate expected profit per round trip ---
     fee_per_trip = 2 * MAKER_FEE * price * qty
     profit_per_trip = spacing * qty - fee_per_trip
     if profit_per_trip <= 0:
         return None
 
     total_margin = num_grids * qty * avg_price / leverage
-    # Final margin sanity check
-    if total_margin > max_margin * 1.01:  # tiny rounding tolerance
+    # Allow 2% over-budget for rounding; if much more, back off qty by one step
+    while total_margin > max_margin * 1.02 and qty - step >= qty_floor:
+        qty = round_qty(qty - step, step)
+        total_margin = num_grids * qty * avg_price / leverage
+    if total_margin > max_margin * 1.02:
         return None
 
+    capital_used_pct = total_margin / balance * 100.0 if balance > 0 else 0.0
     reasoning = (
-        f"Grid: {num_grids} levels, spacing {spacing:.6f} "
-        f"({spacing/price*100:.3f}%), "
-        f"profit/trip {profit_per_trip:.6f} USDT, "
-        f"leverage {leverage}x, margin {total_margin:.2f}/"
-        f"{max_margin:.2f} USDT ({max_capital_pct:.0f}% cap)"
+        f"Grid: {num_grids} lvls, spacing {spacing:.6f} "
+        f"({spacing/price*100:.3f}%), qty {qty:g} "
+        f"(profit/trip {profit_per_trip:.6f} USDT), "
+        f"leverage {leverage}x, margin {total_margin:.2f}/{max_margin:.2f} USDT "
+        f"({capital_used_pct:.0f}% of balance)"
     )
 
     return GridDecision(
@@ -473,9 +479,10 @@ class AIGridStrategy:
             ticker=ticker,
             filters=filters,
             balance=balance,
-            max_leverage=self.ai.max_leverage,
+            max_leverage=min(self.ai.max_leverage, self.grid.max_leverage),
             max_grids=self.grid.max_grids,
             min_grids=self.grid.min_grids,
+            max_capital_pct=self.grid.max_capital_pct,
         )
 
         if decision is None:
