@@ -60,6 +60,9 @@ class TradingBot:
         self._last_rebalance_check: Optional[datetime] = None
         self._last_rebalance_action: Optional[datetime] = None
         self._ticks_since_start = 0
+        # After any close, pause scans for post_exit_cooldown_minutes so
+        # we don't immediately re-enter at a worse price / re-pay fees.
+        self._pause_scans_until: Optional[datetime] = None
 
     def _build_ai_strategy(self) -> AIGridStrategy:
         logger.info("AI grid strategy: {}", self.config.ai.model)
@@ -199,6 +202,38 @@ class TradingBot:
         until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
         self.state.set_cooldown(symbol, until.isoformat())
 
+    def _set_post_exit_cooldown(self) -> None:
+        """After any close, don't start a new grid for a few minutes.
+
+        Prevents the pattern observed in real trades where the bot
+        tore down a grid at a small loss, immediately scanned, picked
+        the same or similar symbol, and paid a fresh set of entry fees
+        before the market had stabilized.
+        """
+        mins = self.config.grid.post_exit_cooldown_minutes
+        if mins <= 0:
+            return
+        self._pause_scans_until = (
+            datetime.now(timezone.utc) + timedelta(minutes=mins)
+        )
+        logger.info("Post-exit cooldown: scanning paused for {} min", mins)
+
+    async def _equity_now(self) -> float:
+        """Fetch current balance + uPnL as a float (0.0 on failure)."""
+        try:
+            return await self.get_equity()
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("get_equity failed: {}", e)
+            return 0.0
+
+    async def _balance_now(self) -> float:
+        """Fetch spot balance (cash, excluding uPnL). 0.0 on failure."""
+        try:
+            return await self.exchange.get_balance()
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("get_balance failed: {}", e)
+            return 0.0
+
     # ---------- main loop ----------
 
     async def run(self) -> None:
@@ -259,8 +294,22 @@ class TradingBot:
                 logger.warning("Bot is PAUSED. Use /resume to unpause.")
                 return
 
-            # If no active grid, try to set one up
+            # If no active grid, try to set one up — but honor the
+            # post-exit cooldown so we don't immediately re-enter after
+            # a losing trade.
             if not self.grid_manager.active:
+                if (
+                    self._pause_scans_until is not None
+                    and datetime.now(timezone.utc) < self._pause_scans_until
+                ):
+                    remaining = (
+                        self._pause_scans_until - datetime.now(timezone.utc)
+                    ).total_seconds()
+                    logger.info(
+                        "Post-exit cooldown: {:.0f}s remaining before next scan",
+                        remaining,
+                    )
+                    return
                 logger.info("No active grid, scanning for setup...")
                 await self._scan_and_setup_grid()
                 return
@@ -312,9 +361,8 @@ class TradingBot:
                 return
 
             # Check max unrealized loss — only tear down on LOSSES, not
-            # on winning trades that happen to have a large uPnL. Also
-            # close the naked position so we don't keep bleeding after
-            # teardown.
+            # on winning trades that happen to have a large uPnL. Report
+            # the actual equity delta after close, not a pre-close estimate.
             if (
                 equity > 0
                 and upnl < 0
@@ -325,13 +373,11 @@ class TradingBot:
                     "Grid uPnL {:.4f} exceeds max_unrealized_loss_pct {:.1f}%, closing grid",
                     upnl, self.config.grid.max_unrealized_loss_pct,
                 )
-                trade_log.log("stop", s=symbol, upnl=upnl, eq=equity, pct=pct, why="upnl")
-                await self.telegram.send(
-                    f"\U0001f6a8 <b>Max unrealized loss</b> exceeded ({upnl:+.4f} USDT)\n"
-                    "Closing position and tearing down grid for safety."
+                await self._close_and_report(
+                    symbol,
+                    reason=f"upnl {upnl:+.4f} ({pct:.1f}% > {self.config.grid.max_unrealized_loss_pct:.1f}%)",
+                    tag="stop",
                 )
-                await self.grid_manager.teardown(close_position=True)
-                self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
                 return
 
             # Heartbeat: periodic compact snapshot of grid health for AI review
@@ -363,16 +409,82 @@ class TradingBot:
                     if dist_from_mid_pct > 40:  # price in outer 20% of range
                         await self._check_rebalance(mark_price)
 
+    def _grid_age_minutes(self) -> float:
+        """Minutes since the current grid was set up (0 if unknown)."""
+        gs = self.grid_manager.grid
+        if not gs.setup_at:
+            return 0.0
+        try:
+            t0 = datetime.fromisoformat(gs.setup_at)
+        except ValueError:
+            return 0.0
+        return (datetime.now(timezone.utc) - t0).total_seconds() / 60.0
+
+    async def _close_and_report(
+        self, symbol: str, reason: str, tag: str,
+    ) -> float:
+        """Tear down the grid and report the REAL equity delta afterwards.
+
+        This is the fix for the "Telegram said I won +$0.13 while I
+        lost" bug. Previously the bot computed a pre-close estimate
+        (realized + uPnL) and broadcast that number, then proceeded to
+        close at taker fees that ate most or all of the estimated gain.
+        Now we close first, measure (post_equity - starting_equity),
+        and use that single exchange-truth number for logs, trade_log,
+        and Telegram. If the close fails, the real delta is whatever
+        the exchange produced and we still report it honestly.
+        """
+        gs = self.grid_manager.grid
+        starting_equity = gs.starting_equity or 0.0
+
+        await self.grid_manager.teardown(close_position=True)
+
+        post_balance = await self._balance_now()
+        # After teardown, grid is flat so equity == balance. Use balance
+        # directly — it's exchange truth, not a derived number.
+        realized_delta = (
+            post_balance - starting_equity
+            if starting_equity > 0 else 0.0
+        )
+        delta_pct = (
+            realized_delta / starting_equity * 100.0
+            if starting_equity > 0 else 0.0
+        )
+
+        outcome = "WIN" if realized_delta > 0 else (
+            "LOSS" if realized_delta < 0 else "FLAT"
+        )
+        trade_log.log(
+            tag, s=symbol, pnl=realized_delta, pct=delta_pct,
+            se=starting_equity, eq=post_balance, why=reason,
+        )
+        emoji = "\U0001f3af" if realized_delta > 0 else "\U0001f6a8"
+        await self.telegram.send(
+            f"{emoji} <b>{tag.upper()} — {outcome}</b> on {symbol}\n"
+            f"Reason: {reason}\n"
+            f"Equity: {starting_equity:.4f} → {post_balance:.4f} USDT\n"
+            f"Realized: <b>{realized_delta:+.4f}</b> USDT ({delta_pct:+.2f}%)"
+        )
+        self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
+        self._set_post_exit_cooldown()
+        return realized_delta
+
     async def _check_position_stop(self, mark_price: float, symbol: str) -> bool:
         """Direct stop-loss on the weighted-average entry price.
 
         Unlike the equity-ratio check, this fires even on moderate equity
         when the naked position is moving fast against us. Returns True
         if the stop fired and the grid was torn down.
+
+        Requires ``min_hold_minutes`` to have elapsed since setup — we
+        don't want a single ugly tick right after setup to unwind a grid
+        that hasn't had a chance to even place its counter orders.
         """
         gs = self.grid_manager.grid
         pct = self.config.grid.position_stop_loss_pct
         if pct <= 0 or abs(gs.net_qty) < 1e-12 or gs.avg_entry <= 0:
+            return False
+        if self._grid_age_minutes() < self.config.grid.min_hold_minutes:
             return False
 
         if gs.net_qty > 0:
@@ -386,54 +498,64 @@ class TradingBot:
 
         logger.warning(
             "Position stop-loss tripped on {}: mark {:.8f} vs avg {:.8f} "
-            "({}{:.2f}% adverse >= {:.2f}%)",
-            symbol, mark_price, gs.avg_entry,
-            "-" if gs.net_qty > 0 else "+", pct, pct,
+            "({:.2f}% adverse)",
+            symbol, mark_price, gs.avg_entry, pct,
         )
-        trade_log.log(
-            "stop", s=symbol, p=mark_price, ae=gs.avg_entry,
-            nq=gs.net_qty, pct=pct, why="pos_sl",
+        await self._close_and_report(
+            symbol, reason=f"pos_sl {pct:.1f}% vs avg", tag="stop",
         )
-        await self.telegram.send(
-            f"\U0001f6a8 <b>Position stop-loss</b> on {symbol}\n"
-            f"mark {mark_price:.8f} vs avg {gs.avg_entry:.8f} "
-            f"({pct:.1f}% adverse)\nClosing and cooling down."
-        )
-        await self.grid_manager.teardown(close_position=True)
-        self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
         return True
 
     async def _check_take_profit(
         self, mark_price: float, upnl: float, equity: float, symbol: str,
     ) -> bool:
-        """Close the grid once total (realized+unrealized) gain >= threshold."""
+        """Close the grid once actual (exchange-truth) gain >= threshold.
+
+        Gain is measured as (current_equity - starting_equity), NOT as
+        synthetic accounting (gs.total_profit + upnl). The synthetic
+        number was booking maker-fee fills but every teardown paid
+        taker fees, so on every TP the Telegram reported a gain that
+        never actually hit the account.
+
+        A streak filter requires N consecutive ticks above threshold
+        before firing, so a volatile wick doesn't collapse a winning
+        grid at a momentary mark spike.
+        """
         pct = self.config.grid.take_profit_pct
-        if pct <= 0 or equity <= 0:
-            return False
         gs = self.grid_manager.grid
-        total_gain = gs.total_profit + upnl
-        if total_gain <= 0:
+        starting_equity = gs.starting_equity
+        if pct <= 0 or starting_equity <= 0 or equity <= 0:
             return False
-        gain_pct = total_gain / equity * 100.0
+        if self._grid_age_minutes() < self.config.grid.min_hold_minutes:
+            return False
+
+        actual_gain = equity - starting_equity
+        gain_pct = actual_gain / starting_equity * 100.0
         if gain_pct < pct:
+            # Reset streak so only CONSECUTIVE over-threshold ticks count
+            if gs.tp_streak != 0:
+                gs.tp_streak = 0
+                self.state.save()
+            return False
+
+        gs.tp_streak += 1
+        self.state.save()
+        required = max(1, self.config.grid.take_profit_streak)
+        if gs.tp_streak < required:
+            logger.info(
+                "TP candidate on {}: gain {:.4f} ({:.2f}%) streak {}/{}",
+                symbol, actual_gain, gain_pct, gs.tp_streak, required,
+            )
             return False
 
         logger.info(
-            "Take-profit hit on {}: total_gain={:.4f} ({:.2f}% of equity) — locking in",
-            symbol, total_gain, gain_pct,
+            "Take-profit firing on {}: actual_gain={:.4f} ({:.2f}% of start eq)",
+            symbol, actual_gain, gain_pct,
         )
-        trade_log.log(
-            "tp", s=symbol, p=mark_price, rp=gs.total_profit,
-            upnl=upnl, eq=equity, pct=gain_pct,
+        await self._close_and_report(
+            symbol, reason=f"tp_streak {gs.tp_streak}x @ {gain_pct:.2f}%",
+            tag="tp",
         )
-        await self.telegram.send(
-            f"\U0001f3af <b>Take-profit</b> on {symbol}\n"
-            f"Total gain: {total_gain:+.4f} USDT ({gain_pct:.2f}% of equity)\n"
-            "Closing grid to lock in."
-        )
-        await self.grid_manager.teardown(close_position=True)
-        # Brief cooldown so we don't re-enter the same symbol at a worse price
-        self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
         return True
 
     async def _scan_and_setup_grid(self) -> None:
@@ -534,7 +656,10 @@ class TradingBot:
                 reasoning=decision.reasoning,
             )
 
-            success = await self.grid_manager.setup_grid(params, filters, mark_price)
+            success = await self.grid_manager.setup_grid(
+                params, filters, mark_price,
+                starting_equity=balance,
+            )
             if success:
                 await self.telegram.send(
                     f"\u2705 <b>Grid active</b> on {choice.symbol}\n"
@@ -598,12 +723,10 @@ class TradingBot:
         trade_log.log("rebal", s=symbol, a=decision.action, why=decision.reasoning)
 
         if decision.action == "EXIT":
-            await self.telegram.send(
-                f"\U0001f6d1 <b>Exiting grid</b> on {symbol}\n"
-                f"<i>{decision.reasoning}</i>"
+            await self._close_and_report(
+                symbol, reason=f"rebal_exit: {decision.reasoning}"[:120],
+                tag="exit",
             )
-            await self.grid_manager.teardown(close_position=True)
-            self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
             self._last_rebalance_action = now
             return
 
@@ -612,9 +735,16 @@ class TradingBot:
                 f"\U0001f504 <b>Rebalancing grid</b> on {symbol}\n"
                 f"<i>{decision.reasoning}</i>"
             )
+            # Carry the original starting_equity into the new grid so
+            # TP stays anchored to the true entry equity — not whatever
+            # the balance happens to be mid-rebalance.
+            carry_equity = self.grid_manager.grid.starting_equity
+            if carry_equity <= 0:
+                carry_equity = await self._balance_now()
             # setup_grid internally tears down + closes naked inventory
             success = await self.grid_manager.setup_grid(
-                decision.new_params, filters, mark_price
+                decision.new_params, filters, mark_price,
+                starting_equity=carry_equity,
             )
             if success:
                 p = decision.new_params

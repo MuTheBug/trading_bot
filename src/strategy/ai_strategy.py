@@ -48,11 +48,14 @@ MAKER_FEE = 0.0002
 MIN_FEE_MULT = 12
 
 # Hard rejection: if |24h change| exceeds this, symbol is considered too
-# trendy for a neutral grid regardless of range.
-MAX_TREND_PCT = 8.0
+# trendy for a neutral grid regardless of range. Tightened from 8% — at
+# 8% we kept selecting coins that were already in a confirmed trend, and
+# grids on trending coins bleed on the rebalance side.
+MAX_TREND_PCT = 5.0
 
-# Require range to exceed change by at least this factor (oscillation check)
-MIN_RANGE_TREND_RATIO = 1.8
+# Require range to exceed change by at least this factor (oscillation check).
+# Bumped from 1.8 — we want genuine chop, not a pump with a small pullback.
+MIN_RANGE_TREND_RATIO = 2.2
 
 
 SYMBOL_SCAN_PROMPT = """\
@@ -322,10 +325,14 @@ class AIGridStrategy:
     ) -> Optional[SymbolChoice]:
         """Score all symbols mathematically, then let AI pick from the top candidates."""
         # Pre-filter: USDT perpetuals with decent volume, tradeable, and
-        # not clearly trending.
+        # not clearly trending. Volume floor comes from config so we can
+        # tune it without code changes; defaults to 50M to reject the
+        # illiquid meme coins (e.g. 币安人生USDT) that were selected in
+        # earlier runs and couldn't fill round trips without slippage.
+        min_vol = self.grid.min_volume_usd
         candidates = [
             t for t in tickers
-            if t.volume_24h > 20_000_000
+            if t.volume_24h > min_vol
             and t.symbol in all_filters
             and t.price > 0
             and t.symbol.endswith("USDT")

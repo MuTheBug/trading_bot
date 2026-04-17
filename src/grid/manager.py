@@ -24,8 +24,9 @@ from ..exchange.base import ExchangeInterface, LimitOrder, SymbolFilters
 from ..state import GridState, GridLevelState, StateStore, TradeRecord, _now_iso
 
 
-# Binance Futures maker fee (0.02%)
-_MAKER_FEE = 0.0002
+# Binance Futures fees
+_MAKER_FEE = 0.0002   # limit-order fills (grid entries / counters)
+_TAKER_FEE = 0.0004   # market orders (emergency closes)
 
 
 @dataclass
@@ -92,9 +93,15 @@ class GridManager:
         params: GridSetupParams,
         filters: SymbolFilters,
         current_price: float,
+        starting_equity: Optional[float] = None,
     ) -> bool:
         """Set up a new grid. Cancels any existing grid first and closes
         any naked net position so the new grid starts flat.
+
+        ``starting_equity`` is the account equity captured at setup time.
+        It anchors all subsequent PnL calculations to exchange truth —
+        actual_gain_anytime = current_equity - starting_equity — instead
+        of summing tracked events (which drift).
 
         Returns True if the grid was set up successfully.
         """
@@ -185,6 +192,10 @@ class GridManager:
         gs.ai_reasoning = params.reasoning
         gs.net_qty = 0.0
         gs.avg_entry = 0.0
+        gs.tp_streak = 0
+        if starting_equity is not None:
+            gs.starting_equity = starting_equity
+            gs.starting_balance = starting_equity  # at setup, position is flat
         self.state.save()
 
         grid_spacing = prices[1] - prices[0] if len(prices) >= 2 else 0
@@ -506,19 +517,20 @@ class GridManager:
 
             fill_price = result.avg_price or last_fill_price or gs.avg_entry
             last_fill_price = fill_price or last_fill_price
-            fee = result.fee or (fill_price * real_qty * _MAKER_FEE * 2)
+            # market_close crosses the spread — it's a TAKER fill. The
+            # maker-fee fallback was understating close costs, which made
+            # synthetic PnL look ~0.02% better than reality on every exit.
+            fee = result.fee or (fill_price * real_qty * _TAKER_FEE)
 
             # Realized PnL uses the tracked avg_entry as cost basis. If
             # tracking was already stale this is approximate, but better
             # than nothing — and it's logged so the AI can see it.
             if fill_price > 0:
                 realized_total += self._realized_pnl(close_side, fill_price, real_qty)
+                # Only update tracking with a real fill price — a zero
+                # would poison avg_entry and corrupt subsequent PnL.
+                self._update_net_position(fill_price, real_qty, close_side)
             fee_total += fee
-
-            # Reflect the close in tracking
-            self._update_net_position(
-                fill_price or gs.avg_entry, real_qty, close_side,
-            )
 
             logger.info(
                 "[GRID] Close attempt {}: {} {:.8f} @ {:.8f} on {} "

@@ -46,6 +46,16 @@ class GridState:
     ai_reasoning: str = ""
     net_qty: float = 0.0        # positive = net long, negative = net short
     avg_entry: float = 0.0      # weighted average entry price of net position
+    # --- Source-of-truth PnL anchors: equity/balance captured at setup ---
+    # Actual grid PnL (at any moment) = current_equity - starting_equity.
+    # This bypasses every bookkeeping drift in total_profit and gives us
+    # the real number for take-profit / stop-loss / Telegram reporting.
+    starting_equity: float = 0.0
+    starting_balance: float = 0.0
+    # Consecutive ticks that the TP threshold has been met. We require
+    # a short streak before actually locking in so a single volatile
+    # wick doesn't tear down a winning grid at a momentary mark spike.
+    tp_streak: int = 0
 
 
 # ---- Legacy position (kept for compatibility with old state files) ----
@@ -147,6 +157,9 @@ def _parse_grid_state(raw: dict) -> GridState:
         ai_reasoning=raw.get("ai_reasoning", ""),
         net_qty=raw.get("net_qty", 0.0),
         avg_entry=raw.get("avg_entry", 0.0),
+        starting_equity=raw.get("starting_equity", 0.0),
+        starting_balance=raw.get("starting_balance", 0.0),
+        tp_streak=raw.get("tp_streak", 0),
     )
 
 

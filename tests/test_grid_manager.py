@@ -432,6 +432,108 @@ async def test_reconcile_closes_orphan_positions():
     assert len(await sim.get_open_positions()) == 0
 
 
+@pytest.mark.asyncio
+async def test_setup_grid_records_starting_equity():
+    """starting_equity captured at setup anchors all subsequent PnL.
+
+    Previously the bot broadcast a pre-close estimate based on synthetic
+    tracking (gs.total_profit + upnl) which was wrong by at least the
+    difference between maker and taker fees. Anchoring against the
+    balance at setup gives the real equity delta at teardown.
+    """
+    sim = FakeSim(price=0.15)
+    await sim.connect()
+    store = StateStore("/tmp/test_grid_starting_eq.json")
+    gm = GridManager(sim, store)
+    filters = _make_filters()
+
+    await gm.setup_grid(
+        _make_params(), filters, current_price=0.15,
+        starting_equity=42.0,
+    )
+    assert gm.grid.starting_equity == 42.0
+    assert gm.grid.starting_balance == 42.0
+    assert gm.grid.tp_streak == 0
+
+
+@pytest.mark.asyncio
+async def test_close_uses_taker_fee_fallback(monkeypatch):
+    """market_close is a TAKER fill — the fee fallback when the exchange
+    doesn't return one must use the taker rate, not maker. Otherwise
+    synthetic PnL is ~0.02% too optimistic on every close, which is
+    exactly how the 'reported +$0.13 while I lost' Telegram bug showed up.
+    """
+    from src.grid import manager as mgr_module
+
+    sim = FakeSim(price=0.15)
+    await sim.connect()
+    store = StateStore("/tmp/test_grid_close_fee.json")
+    gm = GridManager(sim, store)
+    filters = _make_filters()
+
+    await gm.setup_grid(_make_params(), filters, current_price=0.15)
+    gs = gm.grid
+    gs.net_qty = 50.0
+    gs.avg_entry = 0.145
+    store.save()
+
+    await sim.market_open("DOGEUSDT", "BUY", 50.0)
+
+    # Stub market_close to return a result with no fee — so the
+    # manager's fallback path is exercised.
+    from src.exchange.base import OrderResult
+
+    async def _no_fee_close(symbol, side, qty):
+        return OrderResult(
+            order_id="fallback",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            avg_price=0.15,
+            status="FILLED",
+            fee=0.0,
+        )
+
+    monkeypatch.setattr(sim, "market_close", _no_fee_close)
+    monkeypatch.setattr(
+        sim, "get_open_positions", _no_fee_open_positions_factory(["DOGEUSDT"]),
+    )
+
+    realized = await gm.close_net_position()
+    # Taker fee on 0.15 * 50 = 7.5 notional -> 7.5 * 0.0004 = 0.003
+    # Gross realized = (0.15 - 0.145) * 50 = 0.25
+    # Net = 0.25 - 0.003 = 0.247
+    expected_gross = (0.15 - 0.145) * 50.0
+    expected_fee = 0.15 * 50.0 * mgr_module._TAKER_FEE
+    assert realized == pytest.approx(expected_gross - expected_fee, rel=1e-3)
+
+
+def _no_fee_open_positions_factory(symbols_to_drop_after_close):
+    """Returns an async function that yields the position the first time,
+    then empty — simulates the exchange confirming the close on re-query.
+    """
+    state = {"called": 0}
+
+    async def _impl():
+        state["called"] += 1
+        if state["called"] == 1:
+            from src.exchange.base import LivePosition
+            return [
+                LivePosition(
+                    symbol=symbols_to_drop_after_close[0],
+                    side="LONG",
+                    qty=50.0,
+                    entry_price=0.145,
+                    mark_price=0.15,
+                    unrealized_pnl=0.0,
+                    leverage=10,
+                )
+            ]
+        return []
+
+    return _impl
+
+
 # ---- Grid summary ----
 
 @pytest.mark.asyncio
