@@ -31,6 +31,11 @@ grid:
   max_unrealized_loss_pct: 3.0   # close position if uPnL loss exceeds this % of equity
   max_capital_pct: 40.0          # max % of balance the grid may commit as margin
   max_leverage: 5                # hard cap on grid leverage (safer than AI cap)
+  # --- Continuous per-tick safety ---
+  position_stop_loss_pct: 2.0    # close grid if price moves this % adverse from avg_entry
+  take_profit_pct: 2.0           # lock in gains when (realized + unrealized) >= this % of equity
+  symbol_cooldown_minutes: 60    # after EXIT / stop / take-profit, skip that symbol for N min
+  heartbeat_ticks: 30            # write a compact snapshot to trades.log every N ticks (0 = off)
 
 # --- Simulator (paper trading) ---
 simulator:

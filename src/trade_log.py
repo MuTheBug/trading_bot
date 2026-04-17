@@ -24,14 +24,17 @@ _HEADER = """\
 # Trading bot activity log — paste into an AI for strategy review.
 # FMT: ISO_TIME | event | key=value key=value ...
 # events:
-#   sel    symbol selected     s=sym score=X why=reason
-#   skip   setup rejected      why=reason
-#   setup  grid placed         s=sym p=price l=low u=up n=levels lev=lev q=qty sp=spacing pt=profit/trip
-#   fill   order filled        s=sym sd=B|S p=price q=qty lv=level nq=net_qty ae=avg_entry pnl=realized_net fe=fee
-#   close  position closed     s=sym sd=B|S p=price q=qty pnl=realized why=reason
-#   rebal  rebalance decision  s=sym a=HOLD|REBAL|EXIT why=reason
-#   stop   safety stop tripped s=sym upnl=unreal eq=equity pct=loss_pct_of_eq
-#   daily  day summary         pnl=realized fees=paid trades=n wins=n losses=n eq=equity
+#   sel     symbol selected     s=sym score=X why=reason
+#   skip    setup rejected      why=reason
+#   setup   grid placed         s=sym p=price l=low u=up n=levels lev=lev q=qty sp=spacing pt=profit/trip
+#   fill    order filled        s=sym sd=B|S p=price q=qty lv=level nq=net_qty ae=avg_entry pnl=realized_net fe=fee
+#   close   position closed     s=sym sd=B|S p=price q=qty pnl=realized why=reason
+#   rebal   rebalance decision  s=sym a=HOLD|REBAL|EXIT why=reason
+#   stop    safety stop tripped s=sym p=mark ae=avg_entry nq=net_qty pct=X why=pos_sl|upnl
+#   tp      take-profit hit     s=sym p=mark rp=realized upnl=unreal eq=equity pct=gain_pct
+#   tick    heartbeat snapshot  s=sym p=mark nq=net_qty ae=avg_entry upnl=X rp=realized rt=trips eq=equity
+#   cleanup stale orders killed s=sym n=cancelled
+#   daily   day summary         pnl=realized fees=paid trades=n wins=n losses=n eq=equity
 # sd: B=buy S=sell. All prices in quote (USDT). pnl already net of fee.
 """
 

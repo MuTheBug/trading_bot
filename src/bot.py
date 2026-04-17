@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from loguru import logger
@@ -104,9 +104,15 @@ class TradingBot:
         # Clear stale grid from previous session — orders are gone after restart
         if self.state.state.grid.active:
             logger.info("Clearing stale grid from previous session (orders no longer exist)")
+            await self._cleanup_stale_orders(self.state.state.grid.symbol)
             self.state.state.grid.active = False
             self.state.state.grid.levels.clear()
             self.state.save()
+        elif self.state.state.grid.symbol:
+            # No active grid but a previous symbol is remembered — make sure
+            # no stray orders are still sitting on the exchange (e.g. the bot
+            # crashed mid-teardown).
+            await self._cleanup_stale_orders(self.state.state.grid.symbol)
 
         equity = await self.get_equity()
         if self.state.state.peak_equity < equity:
@@ -154,6 +160,31 @@ class TradingBot:
             await self.telegram.send(
                 f"\U0001f6d1 Grid torn down ({reason})"
             )
+
+    async def _cleanup_stale_orders(self, symbol: str) -> None:
+        """Cancel any leftover orders for ``symbol`` on the exchange.
+
+        Addresses the "54 stray open orders" case where previous grid
+        setups were interrupted before their orders got cancelled.
+        """
+        if not symbol:
+            return
+        try:
+            orders = await self.exchange.get_open_orders(symbol)
+            if not orders:
+                return
+            logger.warning("Found {} stale open orders on {}, cancelling", len(orders), symbol)
+            n = await self.exchange.cancel_all_orders(symbol)
+            trade_log.log("cleanup", s=symbol, n=n)
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning("Stale-order cleanup failed for {}: {}", symbol, e)
+
+    def _set_symbol_cooldown(self, symbol: str, minutes: int) -> None:
+        """Set a per-symbol cooldown so we don't immediately re-pick it."""
+        if not symbol or minutes <= 0:
+            return
+        until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        self.state.set_cooldown(symbol, until.isoformat())
 
     # ---------- main loop ----------
 
@@ -248,11 +279,29 @@ class TradingBot:
                     f"qty={ev['qty']:.8f} level={ev['level']}"
                 )
 
+            upnl = self.grid_manager.unrealized_pnl(mark_price)
+
+            # --- Per-tick position stop-loss on the net inventory ---
+            # Direct stop against avg_entry: if price is X% adverse to the
+            # weighted-average fill price of the naked inventory, close
+            # everything. This catches runaway losses before they snowball
+            # into liquidation — which was the PIPPINUSDT failure mode.
+            stopped = await self._check_position_stop(mark_price, symbol)
+            if stopped:
+                return
+
+            # --- Take-profit on the aggregate grid PnL ---
+            # If (realized + unrealized) gain has reached the configured %
+            # of equity, lock it in. Grids that don't harvest wins
+            # eventually give them back.
+            tp_hit = await self._check_take_profit(mark_price, upnl, equity, symbol)
+            if tp_hit:
+                return
+
             # Check max unrealized loss — only tear down on LOSSES, not
             # on winning trades that happen to have a large uPnL. Also
             # close the naked position so we don't keep bleeding after
             # teardown.
-            upnl = self.grid_manager.unrealized_pnl(mark_price)
             if (
                 equity > 0
                 and upnl < 0
@@ -263,13 +312,23 @@ class TradingBot:
                     "Grid uPnL {:.4f} exceeds max_unrealized_loss_pct {:.1f}%, closing grid",
                     upnl, self.config.grid.max_unrealized_loss_pct,
                 )
-                trade_log.log("stop", s=symbol, upnl=upnl, eq=equity, pct=pct)
+                trade_log.log("stop", s=symbol, upnl=upnl, eq=equity, pct=pct, why="upnl")
                 await self.telegram.send(
                     f"\U0001f6a8 <b>Max unrealized loss</b> exceeded ({upnl:+.4f} USDT)\n"
                     "Closing position and tearing down grid for safety."
                 )
                 await self.grid_manager.teardown(close_position=True)
+                self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
                 return
+
+            # Heartbeat: periodic compact snapshot of grid health for AI review
+            hb = self.config.grid.heartbeat_ticks
+            if hb > 0 and self._ticks_since_start % hb == 0:
+                trade_log.log(
+                    "tick", s=symbol, p=mark_price, nq=gs.net_qty,
+                    ae=gs.avg_entry, upnl=upnl, rp=gs.total_profit,
+                    rt=gs.round_trips, eq=equity,
+                )
 
             # Check if price is out of range -> AI rebalance check
             if self.grid_manager.is_price_out_of_range(mark_price, self.config.grid.out_of_range_pct):
@@ -291,6 +350,79 @@ class TradingBot:
                     if dist_from_mid_pct > 40:  # price in outer 20% of range
                         await self._check_rebalance(mark_price)
 
+    async def _check_position_stop(self, mark_price: float, symbol: str) -> bool:
+        """Direct stop-loss on the weighted-average entry price.
+
+        Unlike the equity-ratio check, this fires even on moderate equity
+        when the naked position is moving fast against us. Returns True
+        if the stop fired and the grid was torn down.
+        """
+        gs = self.grid_manager.grid
+        pct = self.config.grid.position_stop_loss_pct
+        if pct <= 0 or abs(gs.net_qty) < 1e-12 or gs.avg_entry <= 0:
+            return False
+
+        if gs.net_qty > 0:
+            adverse = gs.avg_entry * (1 - pct / 100.0)
+            tripped = mark_price <= adverse
+        else:
+            adverse = gs.avg_entry * (1 + pct / 100.0)
+            tripped = mark_price >= adverse
+        if not tripped:
+            return False
+
+        logger.warning(
+            "Position stop-loss tripped on {}: mark {:.8f} vs avg {:.8f} "
+            "({}{:.2f}% adverse >= {:.2f}%)",
+            symbol, mark_price, gs.avg_entry,
+            "-" if gs.net_qty > 0 else "+", pct, pct,
+        )
+        trade_log.log(
+            "stop", s=symbol, p=mark_price, ae=gs.avg_entry,
+            nq=gs.net_qty, pct=pct, why="pos_sl",
+        )
+        await self.telegram.send(
+            f"\U0001f6a8 <b>Position stop-loss</b> on {symbol}\n"
+            f"mark {mark_price:.8f} vs avg {gs.avg_entry:.8f} "
+            f"({pct:.1f}% adverse)\nClosing and cooling down."
+        )
+        await self.grid_manager.teardown(close_position=True)
+        self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
+        return True
+
+    async def _check_take_profit(
+        self, mark_price: float, upnl: float, equity: float, symbol: str,
+    ) -> bool:
+        """Close the grid once total (realized+unrealized) gain >= threshold."""
+        pct = self.config.grid.take_profit_pct
+        if pct <= 0 or equity <= 0:
+            return False
+        gs = self.grid_manager.grid
+        total_gain = gs.total_profit + upnl
+        if total_gain <= 0:
+            return False
+        gain_pct = total_gain / equity * 100.0
+        if gain_pct < pct:
+            return False
+
+        logger.info(
+            "Take-profit hit on {}: total_gain={:.4f} ({:.2f}% of equity) — locking in",
+            symbol, total_gain, gain_pct,
+        )
+        trade_log.log(
+            "tp", s=symbol, p=mark_price, rp=gs.total_profit,
+            upnl=upnl, eq=equity, pct=gain_pct,
+        )
+        await self.telegram.send(
+            f"\U0001f3af <b>Take-profit</b> on {symbol}\n"
+            f"Total gain: {total_gain:+.4f} USDT ({gain_pct:.2f}% of equity)\n"
+            "Closing grid to lock in."
+        )
+        await self.grid_manager.teardown(close_position=True)
+        # Brief cooldown so we don't re-enter the same symbol at a worse price
+        self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
+        return True
+
     async def _scan_and_setup_grid(self) -> None:
         """Scan symbols, let AI pick one, compute grid params, set up the grid."""
         logger.info("Scanning symbols for grid trading...")
@@ -308,6 +440,20 @@ class TradingBot:
                         len(tickers), len(all_filters), balance)
 
             # 2. AI picks the best symbol (scoring is math-based, AI just confirms)
+            # Filter out symbols that are still in cooldown from a recent
+            # bad exit — re-entering the same losing symbol is a leading
+            # cause of PnL spiraling.
+            cooling = [
+                sym for sym in list(self.state.state.cooldown_until.keys())
+                if self.state.is_in_cooldown(sym)
+            ]
+            if cooling:
+                before = len(tickers)
+                tickers = [t for t in tickers if t.symbol not in set(cooling)]
+                logger.info(
+                    "Filtered {} cooldown symbol(s): {} — {}/{} candidates remain",
+                    len(cooling), ",".join(cooling[:5]), len(tickers), before,
+                )
             logger.info("Selecting best symbol for grid trading...")
             choice = await self.ai_strategy.select_symbol(tickers, all_filters)
             if choice is None:
@@ -432,6 +578,7 @@ class TradingBot:
                 f"<i>{decision.reasoning}</i>"
             )
             await self.grid_manager.teardown(close_position=True)
+            self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
             self._last_rebalance_action = now
             return
 

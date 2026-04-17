@@ -116,6 +116,11 @@ class GridConfig(BaseModel):
     max_unrealized_loss_pct: float = 3.0  # force-close grid if uPnL loss exceeds this (of equity)
     max_capital_pct: float = 40.0     # max % of balance the grid may commit as margin
     max_leverage: int = 5             # hard cap on grid leverage (safer than AI cap)
+    # Per-tick position safety
+    position_stop_loss_pct: float = 2.0   # close grid if price moves this far adverse from avg_entry
+    take_profit_pct: float = 2.0          # close grid if (realized+unrealized) gain >= this % of equity
+    symbol_cooldown_minutes: int = 60     # after EXIT/stop, don't re-pick the same symbol for N min
+    heartbeat_ticks: int = 30             # trade_log heartbeat every N ticks (0 = off)
 
 
 class BotConfig(BaseModel):
