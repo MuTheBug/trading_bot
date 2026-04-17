@@ -16,12 +16,13 @@ from typing import Literal, Optional
 
 from loguru import logger
 
+from . import trade_log
 from .config import BotConfig, Secrets
 from .exchange.base import ExchangeInterface
 from .exchange.binance_live import BinanceLiveExchange
 from .exchange.simulator import SimulatorExchange
 from .grid.manager import GridManager, GridSetupParams
-from .state import StateStore, _now_iso
+from .state import StateStore, _now_iso, _today_utc
 from .strategy.ai_strategy import AIGridStrategy
 from .telegram.bot import TelegramNotifier
 
@@ -90,6 +91,7 @@ class TradingBot:
 
     async def start(self) -> None:
         logger.info("Starting grid trading bot in {} mode", self.mode.upper())
+        trade_log.configure(self.config.trade_log_file)
         await self.exchange.connect()
         await self.telegram.start()
 
@@ -194,6 +196,17 @@ class TradingBot:
 
     async def _tick(self) -> None:
         async with self._lock:
+            # Log the outgoing day's totals right before they get reset.
+            if self.state.state.daily.date != _today_utc():
+                d = self.state.state.daily
+                try:
+                    eq = await self.get_equity()
+                except Exception:
+                    eq = 0.0
+                trade_log.log(
+                    "daily", date=d.date, pnl=d.realized_pnl, fees=d.fees_paid,
+                    trades=d.trades, wins=d.wins, losses=d.losses, eq=eq,
+                )
             self.state.roll_daily_if_needed()
             self._ticks_since_start += 1
             logger.info("Tick #{}", self._ticks_since_start)
@@ -245,10 +258,12 @@ class TradingBot:
                 and upnl < 0
                 and abs(upnl) / equity * 100 > self.config.grid.max_unrealized_loss_pct
             ):
+                pct = abs(upnl) / equity * 100
                 logger.warning(
                     "Grid uPnL {:.4f} exceeds max_unrealized_loss_pct {:.1f}%, closing grid",
                     upnl, self.config.grid.max_unrealized_loss_pct,
                 )
+                trade_log.log("stop", s=symbol, upnl=upnl, eq=equity, pct=pct)
                 await self.telegram.send(
                     f"\U0001f6a8 <b>Max unrealized loss</b> exceeded ({upnl:+.4f} USDT)\n"
                     "Closing position and tearing down grid for safety."
@@ -297,10 +312,13 @@ class TradingBot:
             choice = await self.ai_strategy.select_symbol(tickers, all_filters)
             if choice is None:
                 logger.error("Could not select a symbol")
+                trade_log.log("skip", why="no_grid_friendly_symbol")
                 await self.telegram.send("\u274c Could not select a symbol. Will retry.")
                 return
 
             logger.info("Selected: {} score={:.1f} ({})", choice.symbol, choice.score, choice.reasoning)
+            trade_log.log("sel", s=choice.symbol, score=choice.score,
+                          why=choice.reasoning)
             await self.telegram.send(
                 f"\U0001f3af Selected <b>{choice.symbol}</b> (score {choice.score:.1f})\n"
                 f"<i>{choice.reasoning}</i>"
@@ -328,6 +346,7 @@ class TradingBot:
             )
             if decision is None:
                 logger.error("Cannot compute viable grid parameters for {}", choice.symbol)
+                trade_log.log("skip", s=choice.symbol, why="no_viable_params")
                 await self.telegram.send(
                     f"\u274c Cannot compute viable grid for {choice.symbol}. Will retry."
                 )
@@ -405,6 +424,7 @@ class TradingBot:
         )
 
         logger.info("Rebalance decision: {} ({})", decision.action, decision.reasoning)
+        trade_log.log("rebal", s=symbol, a=decision.action, why=decision.reasoning)
 
         if decision.action == "EXIT":
             await self.telegram.send(

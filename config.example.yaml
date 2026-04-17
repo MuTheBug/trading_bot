@@ -46,6 +46,7 @@ kline_history: 200                # candles fetched per request (for AI context)
 # --- Logging ---
 log_level: INFO                   # DEBUG | INFO | WARNING | ERROR
 log_file: logs/bot.log
+trade_log_file: logs/trades.log   # compact event log for AI strategy review
 state_file: state/bot_state.json
 
 # --- Telegram ---

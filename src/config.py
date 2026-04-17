@@ -133,6 +133,7 @@ class BotConfig(BaseModel):
     kline_history: int = 200
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
+    trade_log_file: str = "logs/trades.log"
     state_file: str = "state/bot_state.json"
 
 

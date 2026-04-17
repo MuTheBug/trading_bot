@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from .. import trade_log
 from ..exchange.base import ExchangeInterface, LimitOrder, SymbolFilters
 from ..state import GridState, GridLevelState, StateStore, TradeRecord, _now_iso
 
@@ -194,6 +195,13 @@ class GridManager:
             params.num_grids, grid_spacing, qty, params.leverage,
             buy_count, sell_count,
         )
+        profit_per_trip = grid_spacing * qty - 2 * _MAKER_FEE * prices[len(prices)//2] * qty
+        trade_log.log(
+            "setup", s=params.symbol, p=current_price,
+            l=params.lower_price, u=params.upper_price,
+            n=params.num_grids, lev=params.leverage, q=qty,
+            sp=grid_spacing, pt=profit_per_trip,
+        )
         return True
 
     async def check_fills_and_reorder(self, mark_price: float) -> List[dict]:
@@ -274,6 +282,11 @@ class GridManager:
                     fill_price, level.index, realized_after_fee,
                     gs.net_qty, gs.avg_entry,
                 )
+                trade_log.log(
+                    "fill", s=symbol, sd="B", p=fill_price, q=qty,
+                    lv=level.index, nq=gs.net_qty, ae=gs.avg_entry,
+                    pnl=realized_after_fee, fe=fee,
+                )
                 # Only record PnL when BUY actually CLOSES short inventory
                 if realized != 0.0:
                     self.state.record_grid_fill(realized_after_fee, fee)
@@ -300,6 +313,11 @@ class GridManager:
                     "net_qty={:.6f} avg={:.8f}",
                     fill_price, level.index, realized_after_fee,
                     gs.net_qty, gs.avg_entry,
+                )
+                trade_log.log(
+                    "fill", s=symbol, sd="S", p=fill_price, q=qty,
+                    lv=level.index, nq=gs.net_qty, ae=gs.avg_entry,
+                    pnl=realized_after_fee, fe=fee,
                 )
                 if realized != 0.0:
                     self.state.record_grid_fill(realized_after_fee, fee)
@@ -470,6 +488,10 @@ class GridManager:
         logger.info(
             "[GRID] Closed naked position: {} {} @ {:.8f} realized={:+.5f} fee={:.5f}",
             side, qty, fill_price, net_realized, fee,
+        )
+        trade_log.log(
+            "close", s=symbol, sd=("S" if side == "SELL" else "B"),
+            p=fill_price, q=qty, pnl=net_realized, why="teardown",
         )
         if realized != 0.0 or fee != 0.0:
             self.state.record_grid_fill(net_realized, fee)
