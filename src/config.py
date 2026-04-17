@@ -113,7 +113,9 @@ class GridConfig(BaseModel):
     min_grids: int = 3                # minimum grid levels
     rebalance_check_minutes: int = 60 # how often to ask AI to re-evaluate
     out_of_range_pct: float = 2.0     # % outside grid to trigger AI re-eval
-    max_unrealized_loss_pct: float = 5.0  # force-close grid if uPnL exceeds this
+    max_unrealized_loss_pct: float = 3.0  # force-close grid if uPnL loss exceeds this (of equity)
+    max_capital_pct: float = 40.0     # max % of balance the grid may commit as margin
+    max_leverage: int = 5             # hard cap on grid leverage (safer than AI cap)
 
 
 class BotConfig(BaseModel):
