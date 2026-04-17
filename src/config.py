@@ -118,18 +118,21 @@ class GridConfig(BaseModel):
 
     max_grids: int = 15               # max grid levels AI may create
     min_grids: int = 3                # minimum grid levels
-    rebalance_check_minutes: int = 60 # how often to ask AI to re-evaluate
-    out_of_range_pct: float = 2.0     # % outside grid to trigger AI re-eval
-    max_unrealized_loss_pct: float = 6.0  # force-close grid if uPnL loss exceeds this (of equity)
+    rebalance_check_minutes: int = 15 # how often to ask AI to re-evaluate
+    out_of_range_pct: float = 1.0     # % outside grid to trigger AI re-eval
+    max_unrealized_loss_pct: float = 3.0  # force-close grid if uPnL loss exceeds this (of equity)
     max_capital_pct: float = 60.0     # max % of balance the grid may commit as margin
     max_leverage: int = 5             # hard cap on grid leverage (best winner was 5x)
     # Per-tick position safety
-    position_stop_loss_pct: float = 5.0   # close grid if price moves this far adverse from avg_entry
-    take_profit_pct: float = 3.0          # lock in when actual gain (equity delta) >= this % of balance
+    position_stop_loss_pct: float = 3.0   # close grid if price moves this far adverse from avg_entry
+    drift_exit_pct: float = 2.0           # exit if price drifts this far from grid center (trend emerging)
+    take_profit_pct: float = 2.5          # lock in when actual gain (equity delta) >= this % of start equity
+    trailing_tp_arm_pct: float = 1.5      # arm trailing TP once gain reaches this % of start equity
+    trailing_tp_giveback_pct: float = 0.5 # from peak gain, exit if we give back this much of start equity
     take_profit_streak: int = 2           # require this many consecutive ticks over TP to actually fire
-    min_hold_minutes: int = 10            # don't TP/stop before grid has had time to breathe
-    symbol_cooldown_minutes: int = 60     # after EXIT/stop, don't re-pick the same symbol for N min
-    post_exit_cooldown_minutes: int = 5   # after any close, pause bot entirely before starting new grid
+    min_hold_minutes: int = 5             # don't TP/stop before grid has had time to breathe
+    symbol_cooldown_minutes: int = 120    # after EXIT/stop, don't re-pick the same symbol for N min
+    post_exit_cooldown_minutes: int = 3   # after any close, pause bot entirely before starting new grid
     min_volume_usd: float = 50_000_000    # reject illiquid symbols from scan
     heartbeat_ticks: int = 30             # trade_log heartbeat every N ticks (0 = off)
 

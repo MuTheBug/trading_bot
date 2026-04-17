@@ -48,14 +48,19 @@ MAKER_FEE = 0.0002
 MIN_FEE_MULT = 12
 
 # Hard rejection: if |24h change| exceeds this, symbol is considered too
-# trendy for a neutral grid regardless of range. Tightened from 8% — at
-# 8% we kept selecting coins that were already in a confirmed trend, and
-# grids on trending coins bleed on the rebalance side.
-MAX_TREND_PCT = 5.0
+# trendy for a neutral grid regardless of range.
+MAX_TREND_PCT = 3.0
 
 # Require range to exceed change by at least this factor (oscillation check).
-# Bumped from 1.8 — we want genuine chop, not a pump with a small pullback.
-MIN_RANGE_TREND_RATIO = 2.2
+MIN_RANGE_TREND_RATIO = 2.5
+
+# Price position within the 24h range. 0.0 = sitting at 24h low,
+# 1.0 = sitting at 24h high. Symbols near the extremes are about to
+# break out either way — a neutral grid drawn around them gets caught
+# on the wrong side. Require the current price to be between 25% and
+# 75% of the 24h range.
+MIN_RANGE_POS = 0.25
+MAX_RANGE_POS = 0.75
 
 
 SYMBOL_SCAN_PROMPT = """\
@@ -119,14 +124,30 @@ def score_symbol(t: TickerInfo) -> float:
 
 
 def is_grid_friendly(t: TickerInfo) -> bool:
-    """Hard filter: reject symbols that are clearly trending."""
+    """Hard filter: reject symbols that are clearly trending OR sitting
+    at a 24h extreme (about to break out either direction).
+
+    The "symbols are about to explode" feedback from live trading is
+    exactly this: scoring treated any high-range symbol as good, but
+    a symbol pinned to its 24h high is usually either consolidating
+    for a breakout (bad for a grid above) or just finished rallying
+    and about to reverse (bad for a grid below). Staying middle-of-range
+    keeps the grid on genuine oscillation, not a breakout setup.
+    """
     if t.price <= 0 or t.volume_24h <= 0:
         return False
     if abs(t.change_pct_24h) > MAX_TREND_PCT:
         return False
-    range_pct = (t.high_24h - t.low_24h) / t.price * 100.0
+    rng = t.high_24h - t.low_24h
+    if rng <= 0:
+        return False
+    range_pct = rng / t.price * 100.0
     # Need the range to substantially exceed the net move
     if range_pct < max(abs(t.change_pct_24h) * MIN_RANGE_TREND_RATIO, 1.0):
+        return False
+    # Reject prices sitting at either 24h extreme — typically about to break
+    range_pos = (t.price - t.low_24h) / rng
+    if range_pos < MIN_RANGE_POS or range_pos > MAX_RANGE_POS:
         return False
     return True
 

@@ -343,13 +343,30 @@ class TradingBot:
 
             upnl = self.grid_manager.unrealized_pnl(mark_price)
 
+            # Track peak equity since setup (anchors trailing TP)
+            if equity > gs.peak_equity_since_setup:
+                gs.peak_equity_since_setup = equity
+                self.state.save()
+
+            # --- Drift exit: price has trended far from grid center ---
+            # Gets us out before the position stop fires on a runaway
+            # move. Even if avg_entry hasn't been hit hard yet, a big
+            # drift means the grid will keep loading into the trend and
+            # the equity stop will fire soon anyway — better to exit here
+            # with a smaller loss than ride it down.
+            if await self._check_drift_exit(mark_price, symbol):
+                return
+
             # --- Per-tick position stop-loss on the net inventory ---
-            # Direct stop against avg_entry: if price is X% adverse to the
-            # weighted-average fill price of the naked inventory, close
-            # everything. This catches runaway losses before they snowball
-            # into liquidation — which was the PIPPINUSDT failure mode.
             stopped = await self._check_position_stop(mark_price, symbol)
             if stopped:
+                return
+
+            # --- Trailing take-profit: once we've been meaningfully up,
+            # don't let the gain collapse back to zero. Fires faster than
+            # the fixed take_profit_pct and captures wins that would
+            # otherwise be given back on the next adverse wick.
+            if await self._check_trailing_tp(equity, symbol):
                 return
 
             # --- Take-profit on the aggregate grid PnL ---
@@ -468,6 +485,83 @@ class TradingBot:
         self._set_symbol_cooldown(symbol, self.config.grid.symbol_cooldown_minutes)
         self._set_post_exit_cooldown()
         return realized_delta
+
+    async def _check_drift_exit(self, mark_price: float, symbol: str) -> bool:
+        """Early exit when price has drifted too far from grid center.
+
+        Neutral grids lose in trending markets because every fill
+        stacks more naked inventory into the direction the market is
+        leaving. By the time the 3%-of-equity stop fires, we've
+        already paid a full set of adverse fills. This check bails
+        BEFORE the grid has a chance to load up further.
+        """
+        pct = self.config.grid.drift_exit_pct
+        gs = self.grid_manager.grid
+        if pct <= 0 or gs.upper_price <= gs.lower_price:
+            return False
+        if self._grid_age_minutes() < self.config.grid.min_hold_minutes:
+            return False
+        center = (gs.upper_price + gs.lower_price) / 2
+        if center <= 0:
+            return False
+        drift = abs(mark_price - center) / center * 100.0
+        if drift < pct:
+            return False
+        logger.warning(
+            "Drift exit on {}: mark {:.8f} is {:.2f}% from center {:.8f} (>= {:.2f}%)",
+            symbol, mark_price, drift, center, pct,
+        )
+        await self._close_and_report(
+            symbol, reason=f"drift {drift:.2f}% from center", tag="drift",
+        )
+        return True
+
+    async def _check_trailing_tp(self, equity: float, symbol: str) -> bool:
+        """Trailing take-profit anchored to start equity.
+
+        Arms once gain reaches ``trailing_tp_arm_pct`` of start equity.
+        Once armed, exits as soon as the gain gives back
+        ``trailing_tp_giveback_pct`` of start equity from its peak.
+        """
+        gs = self.grid_manager.grid
+        starting = gs.starting_equity
+        if starting <= 0 or equity <= 0:
+            return False
+        if self._grid_age_minutes() < self.config.grid.min_hold_minutes:
+            return False
+
+        arm_pct = self.config.grid.trailing_tp_arm_pct
+        give_pct = self.config.grid.trailing_tp_giveback_pct
+        if arm_pct <= 0 or give_pct <= 0:
+            return False
+
+        gain_pct = (equity - starting) / starting * 100.0
+        peak_gain_pct = (gs.peak_equity_since_setup - starting) / starting * 100.0
+
+        if not gs.trailing_armed and gain_pct >= arm_pct:
+            gs.trailing_armed = True
+            self.state.save()
+            logger.info(
+                "Trailing TP armed on {}: gain {:.2f}% of start equity", symbol, gain_pct,
+            )
+
+        if not gs.trailing_armed:
+            return False
+
+        giveback_pct = peak_gain_pct - gain_pct
+        if giveback_pct < give_pct:
+            return False
+
+        logger.info(
+            "Trailing TP firing on {}: peak {:.2f}% -> now {:.2f}% (gave back {:.2f}%)",
+            symbol, peak_gain_pct, gain_pct, giveback_pct,
+        )
+        await self._close_and_report(
+            symbol,
+            reason=f"trail: peak {peak_gain_pct:.2f}% -> {gain_pct:.2f}%",
+            tag="trail_tp",
+        )
+        return True
 
     async def _check_position_stop(self, mark_price: float, symbol: str) -> bool:
         """Direct stop-loss on the weighted-average entry price.

@@ -56,6 +56,11 @@ class GridState:
     # a short streak before actually locking in so a single volatile
     # wick doesn't tear down a winning grid at a momentary mark spike.
     tp_streak: int = 0
+    # Highest equity seen since grid setup — anchors the trailing
+    # take-profit: once armed, exit if we give back a configurable
+    # fraction of start equity from the peak.
+    peak_equity_since_setup: float = 0.0
+    trailing_armed: bool = False
 
 
 # ---- Legacy position (kept for compatibility with old state files) ----
@@ -160,6 +165,8 @@ def _parse_grid_state(raw: dict) -> GridState:
         starting_equity=raw.get("starting_equity", 0.0),
         starting_balance=raw.get("starting_balance", 0.0),
         tp_streak=raw.get("tp_streak", 0),
+        peak_equity_since_setup=raw.get("peak_equity_since_setup", 0.0),
+        trailing_armed=raw.get("trailing_armed", False),
     )
 
 

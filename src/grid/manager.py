@@ -193,9 +193,11 @@ class GridManager:
         gs.net_qty = 0.0
         gs.avg_entry = 0.0
         gs.tp_streak = 0
+        gs.trailing_armed = False
         if starting_equity is not None:
             gs.starting_equity = starting_equity
             gs.starting_balance = starting_equity  # at setup, position is flat
+            gs.peak_equity_since_setup = starting_equity
         self.state.save()
 
         grid_spacing = prices[1] - prices[0] if len(prices) >= 2 else 0

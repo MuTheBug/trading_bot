@@ -10,7 +10,7 @@ from src.config import AIConfig, GridConfig
 from src.exchange.base import SymbolFilters, TickerInfo
 from src.strategy.ai_strategy import (
     AIGridStrategy, _extract_json, score_symbol, compute_grid_params,
-    MAKER_FEE, MIN_FEE_MULT,
+    is_grid_friendly, MAKER_FEE, MIN_FEE_MULT,
 )
 
 
@@ -105,6 +105,40 @@ def test_score_symbol_zero_volume():
 def test_score_symbol_zero_price():
     t = TickerInfo("X", 0.0, 1e6, 1.0, 0.01, 0.0)
     assert score_symbol(t) == 0.0
+
+
+def test_is_grid_friendly_rejects_at_24h_high():
+    """A symbol sitting at its 24h high is about to break — not a grid setup."""
+    t = TickerInfo(
+        symbol="X", price=1.10, volume_24h=1e8, change_pct_24h=0.5,
+        high_24h=1.10, low_24h=1.00,
+    )
+    assert not is_grid_friendly(t)
+
+
+def test_is_grid_friendly_rejects_at_24h_low():
+    t = TickerInfo(
+        symbol="X", price=1.00, volume_24h=1e8, change_pct_24h=-0.5,
+        high_24h=1.10, low_24h=1.00,
+    )
+    assert not is_grid_friendly(t)
+
+
+def test_is_grid_friendly_accepts_middle_of_range():
+    t = TickerInfo(
+        symbol="X", price=1.05, volume_24h=1e8, change_pct_24h=0.5,
+        high_24h=1.10, low_24h=1.00,
+    )
+    assert is_grid_friendly(t)
+
+
+def test_is_grid_friendly_rejects_strong_trend():
+    """Tightened MAX_TREND_PCT to 3% so grids don't fight already-moving markets."""
+    t = TickerInfo(
+        symbol="X", price=1.05, volume_24h=1e8, change_pct_24h=4.0,
+        high_24h=1.10, low_24h=1.00,
+    )
+    assert not is_grid_friendly(t)
 
 
 # ---- Symbol selection ----
