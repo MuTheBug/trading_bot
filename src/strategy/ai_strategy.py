@@ -123,6 +123,85 @@ def score_symbol(t: TickerInfo) -> float:
     return osc_ratio * vol_factor
 
 
+def structural_score(
+    closes: List[float], highs: List[float], lows: List[float],
+    drift_exit_pct: float,
+) -> Optional[Dict[str, float]]:
+    """Structural analysis of recent hourly candles.
+
+    Returns a dict of metrics plus a composite score, or None if the
+    data is insufficient / the symbol is obviously unsuitable.
+
+    Metrics:
+    - mean_cross: number of times close crossed the mean (more = more oscillation)
+    - slope_pct: linear-regression slope as % of mean price per hour
+      (near-zero = flat/ranging; large magnitude = trending)
+    - max_candle_pct: largest single-hour high-low range as % of price.
+      If this exceeds drift_exit_pct, ONE hour of action would have
+      drift-exited the grid. Hard reject.
+    - atr_pct: mean hourly range as % of price (steady volatility proxy)
+
+    Composite score: mean_cross * (1 / (1 + abs(slope_pct))) / (atr_pct + 0.1)
+    — reward oscillation, penalise trend, penalise erratic volatility.
+    """
+    n = len(closes)
+    if n < 6 or len(highs) != n or len(lows) != n:
+        return None
+    mean_c = sum(closes) / n
+    if mean_c <= 0:
+        return None
+
+    # Mean crossings
+    crosses = 0
+    prev_above = closes[0] > mean_c
+    for c in closes[1:]:
+        above = c > mean_c
+        if above != prev_above:
+            crosses += 1
+        prev_above = above
+
+    # Linear regression slope (simple least-squares)
+    x = list(range(n))
+    x_mean = sum(x) / n
+    num = sum((x[i] - x_mean) * (closes[i] - mean_c) for i in range(n))
+    den = sum((xi - x_mean) ** 2 for xi in x) or 1.0
+    slope = num / den  # price units per hour
+    slope_pct = slope / mean_c * 100.0
+
+    # Candle structure
+    ranges_pct = [(h - l) / mean_c * 100.0 for h, l in zip(highs, lows) if h >= l]
+    if not ranges_pct:
+        return None
+    max_candle_pct = max(ranges_pct)
+    atr_pct = sum(ranges_pct) / len(ranges_pct)
+
+    # Hard reject: one candle's range alone would have blown the grid
+    if max_candle_pct > drift_exit_pct * 1.3:
+        return {
+            "mean_cross": float(crosses),
+            "slope_pct": slope_pct,
+            "max_candle_pct": max_candle_pct,
+            "atr_pct": atr_pct,
+            "score": 0.0,
+            "rejected": 1.0,
+        }
+
+    # Composite: reward oscillation, penalise trend + erratic volatility
+    composite = (
+        (crosses / max(n, 1)) * 10.0
+        / (1.0 + abs(slope_pct) * 2.0)
+        / (atr_pct + 0.1)
+    )
+    return {
+        "mean_cross": float(crosses),
+        "slope_pct": slope_pct,
+        "max_candle_pct": max_candle_pct,
+        "atr_pct": atr_pct,
+        "score": composite,
+        "rejected": 0.0,
+    }
+
+
 def is_grid_friendly(t: TickerInfo) -> bool:
     """Hard filter: reject symbols that are clearly trending OR sitting
     at a 24h extreme (about to break out either direction).
@@ -351,8 +430,17 @@ class AIGridStrategy:
 
     async def select_symbol(
         self, tickers: List[TickerInfo], all_filters: Dict[str, SymbolFilters],
+        exchange: Any = None,
     ) -> Optional[SymbolChoice]:
-        """Score all symbols mathematically, then let AI pick from the top candidates."""
+        """Score all symbols mathematically, then let AI pick from the top candidates.
+
+        When ``exchange`` is provided, the top candidates by 24h-score are
+        re-ranked using structural analysis of recent hourly candles: a
+        symbol with big single-hour blowouts or a strong directional
+        slope is penalised even if its 24h aggregates look balanced.
+        This catches the "ZEC 10% range but with 4% intraday wicks"
+        case where 24h stats look fine but the grid would never survive.
+        """
         # Pre-filter: USDT perpetuals with decent volume, tradeable, and
         # not clearly trending. Volume floor comes from config so we can
         # tune it without code changes; defaults to 50M to reject the
@@ -381,13 +469,59 @@ class AIGridStrategy:
         # Take top 15 for AI to choose from
         top = scored[:15]
 
+        # --- Structural re-rank via recent 1h candles ---
+        # The 24h ticker tells us the outer envelope but nothing about
+        # the path taken. Two symbols with 10% daily range can be wildly
+        # different for a grid: one with 40 tight 0.5% candles is ideal,
+        # one with a handful of 4% breakout candles is poison.
+        if exchange is not None and hasattr(exchange, "get_klines"):
+            drift_pct = self.grid.drift_exit_pct
+            structural = await self._structural_rerank(
+                [t for t, _ in top], exchange, drift_pct,
+            )
+            if structural:
+                # Combine: structural score wins when available; symbols
+                # that were hard-rejected drop to the bottom.
+                def _combined(item):
+                    t, base = item
+                    m = structural.get(t.symbol)
+                    if m is None:
+                        return base  # keep base if fetch failed
+                    if m.get("rejected"):
+                        return -1.0
+                    # Multiply base by structural quality so both factors
+                    # contribute; structural acts as a reality check on
+                    # the 24h-aggregate score.
+                    return base * (1.0 + m["score"])
+                top = sorted(
+                    [(t, _combined((t, s))) for t, s in top],
+                    key=lambda x: x[1], reverse=True,
+                )
+                # Drop hard-rejected entries
+                top = [(t, s) for t, s in top if s > 0]
+                if not top:
+                    logger.warning(
+                        "Every top candidate hard-rejected by structural filter."
+                    )
+                    return None
+
         # Log the scores
         for t, s in top[:5]:
-            logger.info("  {} score={:.1f} range={:.2f}% chg={:.2f}% vol={:.0f}M",
+            m = ""
+            if exchange is not None and hasattr(exchange, "get_klines"):
+                sm = structural.get(t.symbol) if 'structural' in locals() else None
+                if sm:
+                    m = (
+                        f" | 1h: xings={sm['mean_cross']:.0f} "
+                        f"slope={sm['slope_pct']:+.2f}%/h "
+                        f"max_candle={sm['max_candle_pct']:.2f}% "
+                        f"atr={sm['atr_pct']:.2f}%"
+                    )
+            logger.info("  {} score={:.1f} range={:.2f}% chg={:.2f}% vol={:.0f}M{}",
                         t.symbol, s,
                         (t.high_24h - t.low_24h) / t.price * 100,
                         t.change_pct_24h,
-                        t.volume_24h / 1e6)
+                        t.volume_24h / 1e6, m)
 
         # Build compact data for AI
         ticker_data = [
@@ -548,6 +682,34 @@ class AIGridStrategy:
             ),
             new_params=new_params,
         )
+
+    # ---- Structural re-rank helper ----
+
+    async def _structural_rerank(
+        self, tickers: List[TickerInfo], exchange: Any, drift_pct: float,
+    ) -> Dict[str, Dict[str, float]]:
+        """Fetch recent 1h klines for each candidate and compute structural metrics.
+
+        Runs concurrently so adding this step costs a single round-trip
+        in wall-clock time. Failed fetches are silently skipped — those
+        symbols just keep their base 24h score.
+        """
+        async def _one(t: TickerInfo):
+            try:
+                df = await exchange.get_klines(t.symbol, "1h", limit=24)
+            except Exception as e:  # pragma: no cover
+                logger.debug("klines fetch failed for {}: {}", t.symbol, e)
+                return t.symbol, None
+            try:
+                closes = df["close"].tolist()
+                highs = df["high"].tolist()
+                lows = df["low"].tolist()
+            except Exception:
+                return t.symbol, None
+            return t.symbol, structural_score(closes, highs, lows, drift_pct)
+
+        results = await asyncio.gather(*(_one(t) for t in tickers))
+        return {sym: m for sym, m in results if m is not None}
 
     # ---- API call ----
 

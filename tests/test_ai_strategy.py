@@ -10,7 +10,7 @@ from src.config import AIConfig, GridConfig
 from src.exchange.base import SymbolFilters, TickerInfo
 from src.strategy.ai_strategy import (
     AIGridStrategy, _extract_json, score_symbol, compute_grid_params,
-    is_grid_friendly, MAKER_FEE, MIN_FEE_MULT,
+    is_grid_friendly, structural_score, MAKER_FEE, MIN_FEE_MULT,
 )
 
 
@@ -130,6 +130,54 @@ def test_is_grid_friendly_accepts_middle_of_range():
         high_24h=1.10, low_24h=1.00,
     )
     assert is_grid_friendly(t)
+
+
+def test_structural_score_rewards_oscillation():
+    """A symbol that oscillates tightly should score far above a trending one."""
+    # Oscillating: closes zigzag around 100
+    osc_closes = [100, 101, 99, 101, 99, 101, 99, 101, 99, 101, 99, 101]
+    osc_highs = [c + 0.2 for c in osc_closes]
+    osc_lows = [c - 0.2 for c in osc_closes]
+
+    # Trending: steady +0.5/hour uptrend
+    trend_closes = [100 + i * 0.5 for i in range(12)]
+    trend_highs = [c + 0.2 for c in trend_closes]
+    trend_lows = [c - 0.2 for c in trend_closes]
+
+    osc = structural_score(osc_closes, osc_highs, osc_lows, drift_exit_pct=3.0)
+    trend = structural_score(trend_closes, trend_highs, trend_lows, drift_exit_pct=3.0)
+    assert osc is not None and trend is not None
+    assert osc["score"] > trend["score"]
+    assert osc["mean_cross"] > trend["mean_cross"]
+
+
+def test_structural_score_rejects_blowout_candle():
+    """One hour with a range > drift_exit * 1.3 should hard-reject the symbol —
+    the grid wouldn't survive even a single such candle.
+    """
+    closes = [100] * 12
+    highs = [100.3] * 11 + [104.0]   # one hour with a 4% range
+    lows = [99.7] * 11 + [100.0]
+    m = structural_score(closes, highs, lows, drift_exit_pct=3.0)
+    assert m is not None
+    assert m["rejected"] == 1.0
+    assert m["score"] == 0.0
+
+
+def test_structural_score_accepts_quiet_candles():
+    """Small hourly ranges + mean crossings = ideal grid setup."""
+    closes = [100, 100.5, 99.5, 100.5, 99.5, 100.5, 99.5, 100.5, 99.5, 100.5, 99.5, 100.5]
+    highs = [c + 0.3 for c in closes]
+    lows = [c - 0.3 for c in closes]
+    m = structural_score(closes, highs, lows, drift_exit_pct=3.0)
+    assert m is not None
+    assert m["rejected"] == 0.0
+    assert m["score"] > 0.0
+    assert abs(m["slope_pct"]) < 0.2  # effectively flat
+
+
+def test_structural_score_insufficient_data():
+    assert structural_score([100], [101], [99], drift_exit_pct=3.0) is None
 
 
 def test_is_grid_friendly_rejects_strong_trend():

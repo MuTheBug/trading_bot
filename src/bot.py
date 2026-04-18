@@ -696,7 +696,9 @@ class TradingBot:
                     len(cooling), ",".join(cooling[:5]), len(tickers), before,
                 )
             logger.info("Selecting best symbol for grid trading...")
-            choice = await self.ai_strategy.select_symbol(tickers, all_filters)
+            choice = await self.ai_strategy.select_symbol(
+                tickers, all_filters, exchange=self.exchange,
+            )
             if choice is None:
                 logger.error("Could not select a symbol")
                 trade_log.log("skip", why="no_grid_friendly_symbol")
