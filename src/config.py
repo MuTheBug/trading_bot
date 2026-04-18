@@ -95,7 +95,7 @@ class AIConfig(BaseModel):
 
     enabled: bool = True
     model: str = "MiniMax-M2.7"
-    max_tokens: int = 2048
+    max_tokens: int = 4096  # MiniMax writes a lot of reasoning text before JSON
     thinking: bool = False  # set true to use extended thinking mode
     max_leverage: int = 20  # hard cap on leverage the AI may request
     kline_history: int = 50      # candles included in the prompt

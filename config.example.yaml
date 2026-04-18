@@ -108,7 +108,7 @@ telegram:
 ai:
   enabled: true
   model: MiniMax-M2.7
-  max_tokens: 2048
+  max_tokens: 4096                 # MiniMax is verbose — low values leave no room for the JSON reply
   thinking: false                  # set true for extended thinking (slower)
   max_leverage: 20                 # hard cap on leverage the AI may request
   kline_history: 50                # 15m candles fed to the model

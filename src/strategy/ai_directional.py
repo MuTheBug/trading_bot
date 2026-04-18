@@ -181,8 +181,8 @@ class _CandidateCtx:
             "ind_1h": _ind_snapshot(last1h),
             "regime_15m": _regime_payload(reg15),
             "regime_1h": _regime_payload(reg1h),
-            "candles_15m": _candles(self.df15, 30),
-            "candles_1h": _candles(self.df1h, 20),
+            "candles_15m": _candles(self.df15, 20),
+            "candles_1h": _candles(self.df1h, 12),
         }
 
 
@@ -315,11 +315,13 @@ class AIDirectionalStrategy:
 
     async def _call_ai(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         last_err: Optional[Exception] = None
+        # If a prior attempt hit max_tokens, bump headroom for retries.
+        max_tokens = self.ai.max_tokens
         for attempt in range(self.ai.retries + 1):
             try:
                 kwargs: Dict[str, Any] = dict(
                     model=self.ai.model,
-                    max_tokens=self.ai.max_tokens,
+                    max_tokens=max_tokens,
                     system=system_prompt,
                     messages=[{
                         "role": "user",
@@ -332,7 +334,21 @@ class AIDirectionalStrategy:
                     self._client.messages.create(**kwargs),
                     timeout=self.ai.request_timeout_s,
                 )
-                return _extract_text(msg)
+                text = _extract_text(msg)
+                if not text:
+                    stop = getattr(msg, "stop_reason", None)
+                    usage = getattr(msg, "usage", None)
+                    blocks = [getattr(b, "type", "?") for b in (getattr(msg, "content", None) or [])]
+                    logger.warning(
+                        "AI returned empty text (attempt {}/{}): stop_reason={} blocks={} usage={}",
+                        attempt + 1, self.ai.retries + 1, stop, blocks, usage,
+                    )
+                    if stop == "max_tokens" and attempt < self.ai.retries:
+                        # Model exhausted its budget before producing the JSON.
+                        # Give it more headroom on the next attempt.
+                        max_tokens = min(max_tokens * 2, 8192)
+                        continue
+                return text
             except (APIStatusError, APIError) as e:
                 last_err = e
                 logger.warning(
