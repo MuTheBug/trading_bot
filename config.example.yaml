@@ -27,13 +27,13 @@ grid:
   max_grids: 15                  # max grid levels AI may create
   min_grids: 3                   # minimum grid levels
   rebalance_check_minutes: 15    # how often to ask AI to re-evaluate (lower = react faster to trends)
-  out_of_range_pct: 1.0          # % outside grid to trigger re-eval
-  max_unrealized_loss_pct: 3.0   # hard cap: close position if uPnL loss exceeds this % of equity
-  max_capital_pct: 60.0          # max % of balance the grid may commit as margin
+  out_of_range_pct: 1.5          # % outside grid to trigger re-eval
+  max_unrealized_loss_pct: 5.0   # hard cap: close position if uPnL loss exceeds this % of equity
+  max_capital_pct: 50.0          # max % of balance the grid may commit (lower = headroom for drawdown)
   max_leverage: 5                # hard cap on grid leverage (best real winner was 5x)
   # --- Continuous per-tick safety ---
-  position_stop_loss_pct: 3.0    # close grid if price moves this % adverse from avg_entry
-  drift_exit_pct: 2.0            # exit if price drifts this % from grid center (trend detected)
+  position_stop_loss_pct: 4.0    # close grid if price moves this % adverse from avg_entry
+  drift_exit_pct: 3.0            # exit if price drifts this % from grid center (trend detected)
   take_profit_pct: 2.5           # fixed TP: lock in when ACTUAL equity delta >= this % of start equity
   trailing_tp_arm_pct: 1.5       # arm trailing TP once gain >= this % of start equity
   trailing_tp_giveback_pct: 0.5  # from peak gain, exit if we give back this much of start equity

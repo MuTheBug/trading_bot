@@ -192,9 +192,17 @@ def compute_grid_params(
     if range_24h <= 0:
         range_24h = price * 0.02  # fallback: 2%
 
-    # 40% of 24h range — keeps most movements inside the grid while
-    # giving enough oscillation room to catch round trips.
-    grid_width = range_24h * 0.40
+    # 70% of 24h range. Live trading showed 40% was too narrow — price
+    # escaped the grid within minutes, never completing a single round
+    # trip, and every drift exit booked a net loss (entry fees + exit
+    # taker fees with no realized profit to offset).
+    #
+    # Floor the width at 3% of price so that even on a low-range day
+    # the grid spans more than the drift_exit threshold (~2.5%); if
+    # the grid is narrower than drift_exit, every setup is a guaranteed
+    # exit as soon as the market breathes in one direction.
+    grid_width = range_24h * 0.70
+    grid_width = max(grid_width, price * 0.03)
     grid_width = max(grid_width, min_spacing * min_grids)
 
     # --- 3. Number of grids ---

@@ -279,6 +279,26 @@ def test_compute_grid_params_scales_qty_to_capital_cap():
     )
 
 
+def test_compute_grid_params_grid_width_floor():
+    """Grid width must be at least 3% of price so it's wider than the
+    2.5-3% drift_exit threshold. If the grid is narrower than drift,
+    every setup would drift-exit on the first meaningful move.
+    """
+    # Low-range ticker: only 1% daily range, used to have 40% grid = 0.4% wide
+    ticker = TickerInfo(
+        "SLEEPY", price=1.00, volume_24h=1e8, change_pct_24h=0.1,
+        high_24h=1.005, low_24h=0.995,
+    )
+    filters = SymbolFilters("SLEEPY", 0.0001, 0.01, 0.01, 5.0)
+    decision = compute_grid_params(
+        price=1.00, ticker=ticker, filters=filters, balance=100.0,
+        max_leverage=5, max_grids=15, min_grids=3, max_capital_pct=50.0,
+    )
+    assert decision is not None
+    width_pct = (decision.upper_price - decision.lower_price) / 1.00 * 100.0
+    assert width_pct >= 3.0 - 1e-6, f"grid width {width_pct:.3f}% is below 3% floor"
+
+
 def test_compute_grid_params_respects_capital_cap():
     """Total margin must stay under max_capital_pct of balance."""
     ticker = TickerInfo(
