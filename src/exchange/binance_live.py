@@ -8,6 +8,7 @@ already have filled. Instead we re-query positions to decide.
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 import pandas as pd
@@ -39,6 +40,33 @@ _INTERVAL_MAP = {
 
 
 T = TypeVar("T")
+
+
+def _decimals_for_step(step: float) -> int:
+    """Return the number of decimal places implied by a tick/step size."""
+    if step <= 0:
+        return 8
+    if step >= 1:
+        return 0
+    # log10 of 0.001 is -3 -> 3 decimals. Guard against FP error by rounding.
+    return max(0, int(round(-math.log10(step))))
+
+
+def _fmt_quantity(qty: float, step: float) -> str:
+    """Format a quantity as a string with exact step precision (floored)."""
+    d = _decimals_for_step(step)
+    if step > 0:
+        # Floor to step so we never exceed the intended size by a tick.
+        qty = math.floor(qty / step + 1e-9) * step
+    return f"{qty:.{d}f}"
+
+
+def _fmt_price(price: float, tick: float) -> str:
+    """Format a price as a string with exact tick precision (rounded)."""
+    d = _decimals_for_step(tick)
+    if tick > 0:
+        price = round(price / tick) * tick
+    return f"{price:.{d}f}"
 
 
 def _is_transient(e: Exception) -> bool:
@@ -230,7 +258,9 @@ class BinanceLiveExchange(ExchangeInterface):
     async def _market_order(
         self, symbol: str, side: OrderSide, qty: float, reduce_only: bool
     ) -> OrderResult:
-        params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty)
+        filters = await self.get_symbol_filters(symbol)
+        qty_str = _fmt_quantity(qty, filters.qty_step)
+        params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty_str)
         if reduce_only:
             params["reduceOnly"] = "true"
         r = await self._c().futures_create_order(**params)
@@ -284,13 +314,16 @@ class BinanceLiveExchange(ExchangeInterface):
     async def limit_order(
         self, symbol: str, side: OrderSide, qty: float, price: float,
     ) -> str:
+        filters = await self.get_symbol_filters(symbol)
+        qty_str = _fmt_quantity(qty, filters.qty_step)
+        price_str = _fmt_price(price, filters.price_tick)
         r = await _retry(
             lambda: self._c().futures_create_order(
                 symbol=symbol,
                 side=side,
                 type="LIMIT",
-                quantity=qty,
-                price=price,
+                quantity=qty_str,
+                price=price_str,
                 timeInForce="GTC",
             ),
             what=f"limit_order[{symbol}]",
