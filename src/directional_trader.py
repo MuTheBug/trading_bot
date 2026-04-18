@@ -1,22 +1,27 @@
-"""Directional trading loop: regime-aware long/short with adaptive leverage.
+"""AI-driven directional trading loop (long / short / skip).
 
-Sits beside the grid manager as an alternative trading mode. Each tick:
+Each scan:
 
-1. If no open position, scan symbols for the strongest regime/setup, compute
-   an adaptive trade plan (qty + leverage), and open it with a tiered SL/TP.
-2. If a position is open, let the PositionManager run its rules and react to
-   the returned action (partial close / full close / hold).
+1. Prescreen tickers by liquidity + activity (math, no AI) to cut the
+   universe to a manageable shortlist.
+2. Fetch 15m + 1h klines for each shortlisted symbol.
+3. Build a rich payload (OHLCV tails, indicators, regime classification,
+   account balance, risk caps, recent trade outcomes) and send the WHOLE
+   shortlist to the AI.
+4. The AI returns ONE decision: OPEN_LONG, OPEN_SHORT (with symbol +
+   entry/SL/TPs/leverage) or SKIP.
+5. If a trade, validate + size with the adaptive leverage planner and
+   hand off to the PositionManager.
 
-The scan uses the same scoring approach the AI strategy already has: it ranks
-symbols by recent activity (range_pct & volume) then classifies the regime of
-each candidate to pick the one with the highest confidence.
+The deterministic regime classifier is still run but only to enrich the
+AI's context — it does not constrain direction or setup choice.
 """
 from __future__ import annotations
 
-import asyncio
+import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -24,11 +29,14 @@ from . import trade_log
 from .config import BotConfig, Secrets
 from .exchange.base import ExchangeInterface, SymbolFilters, TickerInfo
 from .position.manager import PositionManager
-from .risk.leverage import TradePlan, compute_trade_plan
+from .risk.leverage import TradePlan, adaptive_leverage, compute_trade_plan
 from .risk.risk_manager import RiskManager
 from .state import StateStore
-from .strategy.adaptive import DirectionalPlan, RegimeAdaptiveStrategy
-from .strategy.regime import RegimeSnapshot
+from .strategy.ai_directional import (
+    AIDecision,
+    AIDirectionalStrategy,
+    _CandidateCtx,
+)
 
 
 @dataclass
@@ -36,19 +44,19 @@ class _Candidate:
     symbol: str
     ticker: TickerInfo
     filters: SymbolFilters
-    score: float           # pre-regime liquidity/activity score
+    score: float
 
 
 def _prescreen(
     tickers: List[TickerInfo],
-    all_filters: dict,
+    all_filters: Dict[str, SymbolFilters],
     min_volume_usd: float,
-    top_n: int = 25,
+    top_n: int,
 ) -> List[_Candidate]:
-    """Filter & rank symbols by activity before running the regime classifier.
+    """Filter + rank candidates by activity before calling the AI.
 
-    Regime classification pulls klines per candidate, so we restrict to a
-    manageable top-N. Scoring favours liquid symbols with real movement.
+    The AI can only reason about the data we feed it, so this is just
+    liquidity + "something's moving" gating. No directional bias here.
     """
     out: List[_Candidate] = []
     for t in tickers:
@@ -59,35 +67,37 @@ def _prescreen(
         filt = all_filters.get(t.symbol)
         if filt is None:
             continue
-        price_range = max(t.high_24h - t.low_24h, 0.0)
-        if price_range <= 0 or t.price <= 0:
+        if t.price <= 0:
             continue
-        range_pct = price_range / t.price * 100.0
-        # Slight bias toward movers; log-scale volume so a $1B coin doesn't
-        # completely drown a $100M gem.
-        import math
-        score = range_pct * math.log10(max(t.volume_24h, 1.0))
+        rng = max(t.high_24h - t.low_24h, 0.0)
+        range_pct = rng / t.price * 100.0 if t.price > 0 else 0.0
+        # Favour symbols that actually moved (either direction).
+        activity = abs(t.change_pct_24h) + 0.5 * range_pct
+        score = activity * math.log10(max(t.volume_24h, 1.0))
         out.append(_Candidate(t.symbol, t, filt, score))
     out.sort(key=lambda c: c.score, reverse=True)
     return out[:top_n]
 
 
 class DirectionalTrader:
-    """Scan + trade one directional position at a time."""
+    """AI-driven long/short trader. One position at a time."""
 
     def __init__(
         self,
         exchange: ExchangeInterface,
         state: StateStore,
         config: BotConfig,
+        secrets: Secrets,
     ) -> None:
         self.ex = exchange
         self.state = state
         self.cfg = config
         self.risk = RiskManager(config.risk, config.grid)
-        self.strategy = RegimeAdaptiveStrategy(
-            adx_strong=config.directional.adx_strong,
-            adx_weak=config.directional.adx_weak,
+        self.ai_strategy = AIDirectionalStrategy(
+            ai_cfg=config.ai,
+            dir_cfg=config.directional,
+            api_key=secrets.ai_api_key,
+            base_url=secrets.ai_base_url,
         )
         self.pm = PositionManager(
             exchange,
@@ -99,13 +109,14 @@ class DirectionalTrader:
             breakeven_after_tp1=config.directional.breakeven_after_tp1,
         )
         self._last_scan: Optional[datetime] = None
+        self._recent_outcomes: List[Dict[str, Any]] = []
+
+    # ---------------- lifecycle ----------------
 
     def has_position(self) -> bool:
         return self.pm.has_position()
 
     async def start(self) -> None:
-        # Reconcile: if the exchange holds a position but we don't know
-        # about it, close it defensively. We only own one position at a time.
         if self.pm.has_position():
             return
         try:
@@ -132,7 +143,6 @@ class DirectionalTrader:
         return bal
 
     async def tick(self) -> None:
-        """One heartbeat of the directional loop."""
         if self.state.state.paused:
             logger.warning("Bot PAUSED — skipping directional tick")
             return
@@ -147,7 +157,6 @@ class DirectionalTrader:
             await self._manage_position()
             return
 
-        # Cooldown between scans so we don't hammer exchange APIs.
         now = datetime.now(timezone.utc)
         if self._last_scan is not None:
             gap = (now - self._last_scan).total_seconds()
@@ -163,7 +172,7 @@ class DirectionalTrader:
         await self.pm.close("MANUAL", mark)  # type: ignore[arg-type]
         trade_log.log("close", why=reason)
 
-    # ------------ management ------------
+    # ---------------- management ----------------
 
     async def _manage_position(self) -> None:
         pos = self.pm.position
@@ -190,24 +199,32 @@ class DirectionalTrader:
             return
         if result.action == "EXIT":
             rp = pos.realised_pnl
+            symbol = pos.symbol
+            side = pos.side
             await self.pm.close(result.reason or "MANUAL", mark)
-            # After the close, measure true realised PnL from state not memory.
-            self._record_exit(pos.symbol, mark, result.reason, rp)
+            self._record_exit(symbol, side, mark, result.reason, rp)
 
     def _record_exit(
-        self, symbol: str, mark: float, reason, prior_realised: float,
+        self, symbol: str, side: str, mark: float, reason, realised_pnl: float,
     ) -> None:
-        trade_log.log("close", s=symbol, p=mark, why=str(reason),
-                      rp=prior_realised)
+        trade_log.log("close", s=symbol, sd=side, p=mark, why=str(reason),
+                      rp=realised_pnl)
         self.state.state.daily.trades += 1
-        if prior_realised > 0:
+        if realised_pnl > 0:
             self.state.state.daily.wins += 1
-        elif prior_realised < 0:
+        elif realised_pnl < 0:
             self.state.state.daily.losses += 1
-        self.state.state.daily.realized_pnl += prior_realised
+        self.state.state.daily.realized_pnl += realised_pnl
         self.state.save()
+        self._recent_outcomes.append({
+            "symbol": symbol,
+            "side": side,
+            "pnl": round(realised_pnl, 4),
+            "reason": str(reason),
+        })
+        self._recent_outcomes = self._recent_outcomes[-10:]
 
-    # ------------ scan & open ------------
+    # ---------------- scan & open ----------------
 
     async def _scan_and_open(self, equity: float) -> None:
         try:
@@ -224,8 +241,6 @@ class DirectionalTrader:
         if not candidates:
             logger.info("No candidates after prescreen")
             return
-
-        # Filter out cooldown symbols.
         candidates = [
             c for c in candidates if not self.state.is_in_cooldown(c.symbol)
         ]
@@ -233,67 +248,126 @@ class DirectionalTrader:
             logger.info("All candidates in cooldown")
             return
 
-        best: Optional[Tuple[_Candidate, DirectionalPlan]] = None
-        # Scan candidates sequentially but cap how many we inspect — each
-        # iteration does 2 kline fetches.
-        limit = min(len(candidates), self.cfg.directional.scan_top_n)
-        for cand in candidates[:limit]:
-            plan = await self._evaluate_candidate(cand)
-            if plan is None:
+        # Build AI context — fetch klines for each shortlisted symbol.
+        ctxs: List[_CandidateCtx] = []
+        for cand in candidates:
+            try:
+                df15 = await self.ex.get_klines(cand.symbol, "15m", 150)
+                df1h = await self.ex.get_klines(cand.symbol, "1h", 100)
+            except Exception as e:
+                logger.debug("klines failed for {}: {}", cand.symbol, e)
                 continue
-            if best is None or plan.confidence > best[1].confidence:
-                best = (cand, plan)
-            # Early exit: if we find a high-confidence setup, stop scanning.
-            if plan.confidence >= 0.85:
-                break
+            if df15 is None or df1h is None or len(df15) < 60 or len(df1h) < 60:
+                continue
+            ctxs.append(_CandidateCtx(
+                symbol=cand.symbol, ticker=cand.ticker, filters=cand.filters,
+                df15=df15, df1h=df1h,
+            ))
 
-        if best is None:
-            logger.info("No tradable regime found across {} candidates", limit)
+        if not ctxs:
+            logger.info("No candidates with sufficient kline history")
             return
 
-        cand, plan = best
-        # Cap check: don't trade below confidence threshold.
-        if plan.confidence < self.cfg.directional.min_confidence:
+        logger.info(
+            "AI directional scan: {} candidates, balance={:.4f}",
+            len(ctxs), equity,
+        )
+        decision = await self.ai_strategy.decide(
+            candidates=ctxs,
+            balance=equity,
+            recent_outcomes=self._recent_outcomes,
+        )
+        if decision is None:
+            logger.warning("AI returned no decision — skipping")
+            trade_log.log("skip", why="ai_no_decision")
+            return
+        if not decision.is_trade:
+            logger.info("AI decided SKIP: {}", decision.reasoning)
+            trade_log.log("skip", why=f"ai_skip:{decision.reasoning[:80]}")
+            return
+        if decision.confidence < self.cfg.directional.min_confidence:
             logger.info(
-                "Best candidate {} below confidence threshold ({:.2f} < {:.2f})",
-                cand.symbol, plan.confidence,
-                self.cfg.directional.min_confidence,
+                "AI confidence {:.2f} below threshold {:.2f} — skipping",
+                decision.confidence, self.cfg.directional.min_confidence,
+            )
+            trade_log.log(
+                "skip", s=decision.symbol,
+                why=f"ai_low_conf:{decision.confidence:.2f}",
             )
             return
 
-        await self._open_trade(cand, plan, equity)
+        # Resolve the context for the chosen symbol.
+        chosen = next((c for c in ctxs if c.symbol == decision.symbol), None)
+        if chosen is None:
+            logger.warning(
+                "AI chose {} which is not in the shortlist; skipping",
+                decision.symbol,
+            )
+            trade_log.log(
+                "skip", s=decision.symbol, why="ai_symbol_off_list",
+            )
+            return
 
-    async def _evaluate_candidate(
-        self, cand: _Candidate,
-    ) -> Optional[DirectionalPlan]:
-        try:
-            df15 = await self.ex.get_klines(cand.symbol, "15m", 150)
-            df1h = await self.ex.get_klines(cand.symbol, "1h", 100)
-        except Exception as e:
-            logger.debug("klines failed for {}: {}", cand.symbol, e)
-            return None
-        try:
-            return self.strategy.plan(df15, df1h)
-        except Exception as e:  # pragma: no cover — defensive
-            logger.debug("plan failed for {}: {}", cand.symbol, e)
-            return None
+        await self._open_from_decision(chosen, decision, equity)
 
-    async def _open_trade(
-        self, cand: _Candidate, plan: DirectionalPlan, equity: float,
+    async def _open_from_decision(
+        self, cand: _CandidateCtx, decision: AIDecision, equity: float,
     ) -> None:
-        atr_pct = plan.atr / plan.entry_price * 100.0 if plan.entry_price > 0 else 0
+        assert decision.entry is not None and decision.stop_loss is not None
+        # Fills at market. Anchor to the live mark price, not the AI's
+        # remembered entry, to avoid a stale quote from the prompt.
+        try:
+            entry = await self.ex.get_mark_price(cand.symbol)
+        except Exception:
+            entry = decision.entry
+
+        # Rescale SL + TPs if the AI's entry was different — preserve its
+        # intended R-multiples relative to the real fill price.
+        if decision.entry > 0 and abs(entry - decision.entry) / decision.entry > 0.002:
+            ratio = entry / decision.entry
+            stop_loss = decision.stop_loss * ratio
+            take_profits = [(p * ratio, pct) for p, pct in decision.take_profits]
+        else:
+            stop_loss = decision.stop_loss
+            take_profits = list(decision.take_profits)
+
+        # Sanity: SL on right side of real entry.
+        if decision.action == "OPEN_LONG" and stop_loss >= entry:
+            logger.warning("Skipping: SL >= entry for long after rescale")
+            return
+        if decision.action == "OPEN_SHORT" and stop_loss <= entry:
+            logger.warning("Skipping: SL <= entry for short after rescale")
+            return
+
+        # ATR estimate for trailing stop distance: derive from SL distance
+        # as a reasonable proxy — if we don't have an ATR from the payload
+        # we can scale from the chosen SL (usually ~1.5-2x ATR).
+        sl_distance = abs(entry - stop_loss)
+        atr_at_entry = sl_distance / 1.8 if sl_distance > 0 else 0.0
+        atr_pct = atr_at_entry / entry * 100.0 if entry > 0 else 1.0
+
+        # Leverage: use AI's choice if provided, else adaptive.
+        max_lev = self.cfg.directional.max_leverage
+        min_lev = self.cfg.directional.min_leverage
+        if decision.leverage and decision.leverage > 0:
+            leverage = max(min_lev, min(decision.leverage, max_lev))
+        else:
+            leverage = adaptive_leverage(
+                decision.confidence, atr_pct,
+                base_leverage=self.cfg.directional.base_leverage,
+                max_leverage=max_lev, min_leverage=min_lev,
+            )
+
         tp = compute_trade_plan(
             equity=equity,
-            entry_price=plan.entry_price,
-            stop_price=plan.stop_loss,
+            entry_price=entry, stop_price=stop_loss,
             filters=cand.filters,
             risk_pct=self.cfg.directional.risk_per_trade_pct,
-            confidence=plan.confidence,
+            confidence=decision.confidence,
             atr_pct=atr_pct,
-            base_leverage=self.cfg.directional.base_leverage,
-            max_leverage=self.cfg.directional.max_leverage,
+            base_leverage=leverage, max_leverage=max_lev,
             max_margin_pct=self.cfg.directional.max_margin_pct,
-            min_leverage=self.cfg.directional.min_leverage,
+            min_leverage=min_lev,
         )
         if not tp.feasible:
             logger.info(
@@ -302,16 +376,17 @@ class DirectionalTrader:
             trade_log.log("skip", s=cand.symbol, why=f"infeasible:{tp.reason}")
             return
 
+        side = "LONG" if decision.action == "OPEN_LONG" else "SHORT"
         try:
             await self.pm.open(
                 symbol=cand.symbol,
-                side=plan.side,
+                side=side,  # type: ignore[arg-type]
                 qty=tp.qty,
-                entry_price=plan.entry_price,
-                stop_loss=plan.stop_loss,
-                take_profits=plan.take_profits,
+                entry_price=entry,
+                stop_loss=stop_loss,
+                take_profits=take_profits,
                 leverage=tp.leverage,
-                atr_at_entry=plan.atr,
+                atr_at_entry=atr_at_entry,
                 filters=cand.filters,
                 equity_at_open=equity,
                 margin_type=self.cfg.margin_type,
@@ -322,11 +397,11 @@ class DirectionalTrader:
             return
 
         trade_log.log(
-            "setup", s=cand.symbol, sd=plan.side[:1],
-            p=plan.entry_price, q=tp.qty, lev=tp.leverage,
-            sl=plan.stop_loss, reg=plan.regime.regime,
-            conf=f"{plan.confidence:.2f}",
-            why=plan.reason[:60],
+            "setup", s=cand.symbol, sd=side[:1],
+            p=entry, q=tp.qty, lev=tp.leverage,
+            sl=stop_loss,
+            conf=f"{decision.confidence:.2f}",
+            why=decision.reasoning[:80],
         )
 
 

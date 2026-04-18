@@ -155,9 +155,9 @@ class DirectionalConfig(BaseModel):
 
     # Scanning
     min_volume_usd: float = 50_000_000
-    scan_top_n: int = 20                   # how many candidates to regime-classify
-    scan_interval_seconds: int = 30        # min gap between scans when flat
-    min_confidence: float = 0.45           # reject setups below this confidence
+    scan_top_n: int = 10                   # candidates sent to the AI per scan
+    scan_interval_seconds: int = 60        # min gap between scans when flat
+    min_confidence: float = 0.45           # reject if the AI's self-confidence is below this
 
     # Regime detection thresholds
     adx_strong: float = 25.0
@@ -179,7 +179,7 @@ class BotConfig(BaseModel):
     timeframe: str = "15m"
     htf_timeframe: str = "1h"
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
-    trading_mode: TradingMode = "grid"
+    trading_mode: TradingMode = "directional"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     exits: ExitsConfig = Field(default_factory=ExitsConfig)

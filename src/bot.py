@@ -50,7 +50,7 @@ class TradingBot:
         # Directional trader is built lazily for grid-mode users so they
         # don't pay the import cost of the regime stack.
         self.directional: Optional[DirectionalTrader] = (
-            DirectionalTrader(self.exchange, self.state, config)
+            DirectionalTrader(self.exchange, self.state, config, secrets)
             if config.trading_mode == "directional" else None
         )
         self.telegram = TelegramNotifier(

@@ -10,14 +10,14 @@ htf_timeframe: 1h         # higher-timeframe (unused by grid but kept for future
 margin_type: ISOLATED     # ISOLATED | CROSSED
 
 # --- Trading mode ---
-# grid: neutral grid trading (legacy, AI picks a ranging symbol and
-#       places orders on both sides)
-# directional: regime-adaptive long/short with adaptive leverage. Scans
-#              the market, classifies the regime (trend / range / breakout
-#              / chop) and opens a single position with tiered take-profit
-#              + trailing stop + breakeven move. Works with capital as
-#              small as $10 by scaling leverage up to meet min-notional.
-trading_mode: grid        # grid | directional
+# directional (default): AI-driven long/short. Each scan, the bot sends
+#   full market context (OHLCV, indicators, regime, balance, recent
+#   trades) for a shortlist of candidates to the AI and executes the
+#   single decision it returns (OPEN_LONG/OPEN_SHORT/SKIP) with
+#   adaptive leverage + tiered TP + trailing stop + breakeven.
+# grid: legacy neutral grid trading (AI picks a ranging symbol and
+#   places orders on both sides).
+trading_mode: directional  # directional | grid
 
 # --- Risk management ---
 risk:
@@ -54,8 +54,11 @@ grid:
   min_volume_usd: 50000000       # minimum 24h volume to even consider a symbol
   heartbeat_ticks: 30            # write a compact snapshot to trades.log every N ticks (0 = off)
 
-# --- Directional (regime-adaptive long/short) ---
+# --- Directional (AI long/short) ---
 # Only used when trading_mode: directional.
+# The AI decides side, entry, SL, TPs, and (optionally) leverage for each
+# trade. These settings are the HARD CAPS and defaults the AI operates
+# within — risk_per_trade_pct and max_leverage are not negotiable.
 directional:
   risk_per_trade_pct: 1.0       # % of equity risked per trade (at SL)
   base_leverage: 3              # preferred leverage in neutral conditions
@@ -63,9 +66,9 @@ directional:
   max_leverage: 20              # hard cap
   max_margin_pct: 85.0          # margin must not exceed % of equity
   min_volume_usd: 50000000      # minimum 24h volume to consider a symbol
-  scan_top_n: 20                # how many candidates to regime-classify per scan
-  scan_interval_seconds: 30     # min gap between scans when flat
-  min_confidence: 0.45          # reject setups below this regime-confidence
+  scan_top_n: 10                # how many candidates to send to the AI per scan (fewer = faster + cheaper tokens)
+  scan_interval_seconds: 60     # min gap between scans when flat
+  min_confidence: 0.45          # reject the AI's setup if its confidence < this
   adx_strong: 25.0              # ADX >= this => strong trend regime
   adx_weak: 18.0                # ADX in [weak, strong) => weak trend
   trail_atr_mult: 1.5           # trailing stop distance = mult * ATR
