@@ -18,6 +18,7 @@ from loguru import logger
 
 from . import trade_log
 from .config import BotConfig, Secrets
+from .directional_trader import DirectionalTrader
 from .exchange.base import ExchangeInterface
 from .exchange.binance_live import BinanceLiveExchange
 from .exchange.simulator import SimulatorExchange
@@ -46,6 +47,12 @@ class TradingBot:
         self.exchange: ExchangeInterface = self._build_exchange()
         self.grid_manager = GridManager(self.exchange, self.state)
         self.ai_strategy = self._build_ai_strategy()
+        # Directional trader is built lazily for grid-mode users so they
+        # don't pay the import cost of the regime stack.
+        self.directional: Optional[DirectionalTrader] = (
+            DirectionalTrader(self.exchange, self.state, config)
+            if config.trading_mode == "directional" else None
+        )
         self.telegram = TelegramNotifier(
             token=secrets.telegram_bot_token,
             chat_id=secrets.telegram_chat_id,
@@ -93,10 +100,15 @@ class TradingBot:
     # ---------- lifecycle ----------
 
     async def start(self) -> None:
-        logger.info("Starting grid trading bot in {} mode", self.mode.upper())
+        logger.info(
+            "Starting {} bot in {} mode",
+            self.config.trading_mode, self.mode.upper(),
+        )
         trade_log.configure(self.config.trade_log_file)
         await self.exchange.connect()
         await self.telegram.start()
+        if self.directional is not None:
+            await self.directional.start()
 
         # Clear auto-pause from previous session on fresh restart
         if self.state.state.paused:
@@ -158,6 +170,14 @@ class TradingBot:
 
     async def get_equity(self) -> float:
         bal = await self.exchange.get_balance()
+        if self.directional is not None and self.directional.has_position():
+            try:
+                pos = self.directional.pm.position
+                mark = await self.exchange.get_mark_price(pos.symbol)
+                return bal + pos.unrealised_pnl(mark)
+            except Exception:
+                pass
+            return bal
         if self.grid_manager.active:
             try:
                 mark = await self.exchange.get_mark_price(self.grid_manager.grid.symbol)
@@ -292,6 +312,11 @@ class TradingBot:
 
             if self.state.state.paused:
                 logger.warning("Bot is PAUSED. Use /resume to unpause.")
+                return
+
+            # Directional mode: regime-adaptive long/short trader.
+            if self.directional is not None:
+                await self.directional.tick()
                 return
 
             # If no active grid, try to set one up — but honor the

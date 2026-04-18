@@ -137,10 +137,49 @@ class GridConfig(BaseModel):
     heartbeat_ticks: int = 30             # trade_log heartbeat every N ticks (0 = off)
 
 
+class DirectionalConfig(BaseModel):
+    """Regime-adaptive directional trading (long/short).
+
+    Enable by setting ``trading_mode: directional`` at the top level of
+    config.yaml. The bot scans for the highest-confidence market regime on
+    each tick and opens a single position with adaptive leverage sized so
+    the SL risks ``risk_per_trade_pct`` of current equity.
+    """
+
+    # Sizing / leverage
+    risk_per_trade_pct: float = 1.0        # % of equity risked per trade at SL
+    base_leverage: int = 3                 # preferred leverage when conditions neutral
+    min_leverage: int = 1
+    max_leverage: int = 20                 # hard cap
+    max_margin_pct: float = 85.0           # margin must not exceed this % of equity
+
+    # Scanning
+    min_volume_usd: float = 50_000_000
+    scan_top_n: int = 20                   # how many candidates to regime-classify
+    scan_interval_seconds: int = 30        # min gap between scans when flat
+    min_confidence: float = 0.45           # reject setups below this confidence
+
+    # Regime detection thresholds
+    adx_strong: float = 25.0
+    adx_weak: float = 18.0
+
+    # Position management
+    trail_atr_mult: float = 1.5
+    trail_arm_atr: float = 1.0             # arm trailing after +1 ATR profit
+    breakeven_buffer_atr: float = 0.1
+    breakeven_after_tp1: bool = True
+    time_stop_hours: float = 24.0
+    max_loss_pct: float = 6.0              # hard cap % of open-equity
+
+
+TradingMode = Literal["grid", "directional"]
+
+
 class BotConfig(BaseModel):
     timeframe: str = "15m"
     htf_timeframe: str = "1h"
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
+    trading_mode: TradingMode = "grid"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     exits: ExitsConfig = Field(default_factory=ExitsConfig)
@@ -148,6 +187,7 @@ class BotConfig(BaseModel):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     grid: GridConfig = Field(default_factory=GridConfig)
+    directional: DirectionalConfig = Field(default_factory=DirectionalConfig)
     loop_interval_seconds: int = 10
     kline_history: int = 200
     log_level: str = "INFO"
