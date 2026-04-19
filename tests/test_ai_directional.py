@@ -1,11 +1,49 @@
 """Tests for AI directional strategy parser / validator."""
+import numpy as np
+import pandas as pd
 import pytest
 
+from src.exchange.base import SymbolFilters, TickerInfo
 from src.strategy.ai_directional import (
     AIDecision,
+    _CandidateCtx,
     _extract_json,
     _parse_decision,
 )
+
+
+def _ohlcv(closes):
+    n = len(closes)
+    idx = pd.date_range("2024-01-01", periods=n, freq="15min", tz="UTC")
+    return pd.DataFrame({
+        "open": closes, "high": closes * 1.002, "low": closes * 0.998,
+        "close": closes, "volume": np.full(n, 1000.0),
+    }, index=idx)
+
+
+def test_mtf_payload_is_top_down_and_ordered():
+    closes_1d = np.linspace(100, 120, 80)
+    closes_4h = np.linspace(100, 122, 80)
+    closes_1h = np.linspace(110, 122, 80)
+    closes_15m = np.linspace(118, 122, 80)
+    dfs = {
+        "1d": _ohlcv(closes_1d),
+        "4h": _ohlcv(closes_4h),
+        "1h": _ohlcv(closes_1h),
+        "15m": _ohlcv(closes_15m),
+    }
+    ticker = TickerInfo("BTCUSDT", price=122.0, volume_24h=1e9,
+                        change_pct_24h=2.0, high_24h=125.0, low_24h=118.0)
+    filters = SymbolFilters("BTCUSDT", 0.01, 0.001, 0.001, 5.0)
+    ctx = _CandidateCtx(symbol="BTCUSDT", ticker=ticker, filters=filters, dfs=dfs)
+    p = ctx.payload()
+    assert "tf" in p
+    tfs = [block["tf"] for block in p["tf"]]
+    assert tfs == ["1d", "4h", "1h", "15m"]  # top-down preserved
+    for block in p["tf"]:
+        assert "regime" in block
+        assert "ind" in block
+        assert "candles" in block and len(block["candles"]) > 0
 
 
 def test_parse_valid_long():

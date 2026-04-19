@@ -158,6 +158,12 @@ class DirectionalConfig(BaseModel):
     scan_top_n: int = 10                   # candidates sent to the AI per scan
     scan_interval_seconds: int = 60        # min gap between scans when flat
     min_confidence: float = 0.45           # reject if the AI's self-confidence is below this
+    # Multi-timeframe analysis: top-down ordered list of timeframes the
+    # AI receives per candidate. Must be ordered HIGHEST -> LOWEST.
+    # Supported: 1d, 4h, 1h, 15m, 5m, 3m, 1m.
+    mtf_timeframes: List[str] = Field(
+        default_factory=lambda: ["1d", "4h", "1h", "15m"]
+    )
 
     # Regime detection thresholds
     adx_strong: float = 25.0

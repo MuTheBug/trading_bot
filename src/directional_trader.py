@@ -268,20 +268,29 @@ class DirectionalTrader:
             logger.info("All candidates in cooldown")
             return
 
-        # Build AI context — fetch klines for each shortlisted symbol.
+        # Build AI context — fetch klines for every configured timeframe
+        # (top-down MTF). Skip the candidate if any TF has insufficient data.
+        mtf_tfs = self.cfg.directional.mtf_timeframes or ["1h", "15m"]
         ctxs: List[_CandidateCtx] = []
         for cand in candidates:
-            try:
-                df15 = await self.ex.get_klines(cand.symbol, "15m", 150)
-                df1h = await self.ex.get_klines(cand.symbol, "1h", 100)
-            except Exception as e:
-                logger.debug("klines failed for {}: {}", cand.symbol, e)
-                continue
-            if df15 is None or df1h is None or len(df15) < 60 or len(df1h) < 60:
+            dfs: Dict[str, Any] = {}
+            ok = True
+            for tf in mtf_tfs:
+                try:
+                    df = await self.ex.get_klines(cand.symbol, tf, 150)
+                except Exception as e:
+                    logger.debug("klines failed for {} {}: {}", cand.symbol, tf, e)
+                    ok = False
+                    break
+                if df is None or len(df) < 60:
+                    ok = False
+                    break
+                dfs[tf] = df
+            if not ok or not dfs:
                 continue
             ctxs.append(_CandidateCtx(
                 symbol=cand.symbol, ticker=cand.ticker, filters=cand.filters,
-                df15=df15, df1h=df1h,
+                dfs=dfs,
             ))
 
         if not ctxs:

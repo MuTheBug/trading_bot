@@ -69,6 +69,12 @@ directional:
   scan_top_n: 10                # how many candidates to send to the AI per scan (fewer = faster + cheaper tokens)
   scan_interval_seconds: 60     # min gap between scans when flat
   min_confidence: 0.45          # reject the AI's setup if its confidence < this
+  # Multi-timeframe analysis. The AI receives each candidate's data for
+  # every timeframe listed here, ordered TOP-DOWN (highest first, lowest
+  # last). The model is instructed to: (1) read the HTF trend, (2) confirm
+  # on MTF, (3) use LTF only for entry timing. Supported: 1d, 4h, 1h, 15m,
+  # 5m, 3m, 1m. More TFs = more context but more tokens and slower scans.
+  mtf_timeframes: ["1d", "4h", "1h", "15m"]
   adx_strong: 25.0              # ADX >= this => strong trend regime
   adx_weak: 18.0                # ADX in [weak, strong) => weak trend
   trail_atr_mult: 1.5           # trailing stop distance = mult * ATR

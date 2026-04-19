@@ -57,14 +57,24 @@ from .regime import classify_regime
 AI_SYSTEM_PROMPT = """\
 You are the brain of a Binance USDT-M Futures autonomous trading bot.
 
-You receive a shortlist of USDT perpetual candidates with their OHLCV \
-history, indicator snapshots, regime classification, and the account \
-balance + caps. Decide ONE action:
+For each candidate you receive a multi-timeframe (MTF) payload under \
+`tf` ordered from the HIGHEST timeframe to the LOWEST. Always reason \
+TOP-DOWN:
+
+ 1. Highest TF (e.g. 1d): identify the dominant trend and any major \
+    support/resistance. If the HTF is choppy or mid-range, prefer SKIP.
+ 2. Intermediate TFs (4h / 1h): confirm the HTF bias. Disagreement \
+    between HTF and MTF is a red flag — prefer SKIP unless a clear \
+    reversal pattern exists with volume confirmation.
+ 3. Lowest TF (15m / 5m): use ONLY for entry timing. Don't take a trade \
+    just because the 15m looks good; it must align with the 4h/1h bias.
+
+You decide ONE action:
 
  1. Open a LONG or SHORT on one symbol with explicit stop-loss and \
     take-profit prices.
- 2. Or SKIP — no trade if setups are weak, ambiguous, or dangerous \
-    (choppy/low-volume/news-driven).
+ 2. Or SKIP — no trade if setups are weak, ambiguous, HTF & LTF \
+    disagree, or the market is too choppy / low-volume.
 
 You can freely take long or short positions. Pick the side with the \
 clearest edge, not a default direction.
@@ -73,20 +83,24 @@ Rules you MUST follow:
 - Price must be close to current price (fills at market). Use the \
   symbol's current `price` as entry.
 - stop_loss must be on the LOSS side of entry (below for long, above \
-  for short). Distance should reflect actual risk (usually 1.2-2.5x ATR).
+  for short). Distance should reflect actual risk (usually 1.2-2.5x ATR \
+  of the entry TF). Place SL beyond the nearest meaningful structural \
+  level from the intermediate TF (swing low/high, EMA50), not just at \
+  a round number.
 - Each take_profit entry is [price, close_pct]. Prices must be ordered \
   away from entry (ascending for long, descending for short). close_pct \
-  values sum to 100. Reward:risk on the final TP should be >= 1.5.
+  values sum to 100. Reward:risk on the final TP should be >= 1.5. Use \
+  HTF structural levels as TP targets when possible.
 - leverage: 0 = let the bot auto-size based on account and SL distance. \
   Otherwise must be in [min_leverage, max_leverage] from the payload.
-- confidence: 0.0-1.0 self-assessment. Scores below 0.45 should SKIP.
+- confidence: 0.0-1.0. A valid trade requires MTF alignment across at \
+  least 2 of 3 adjacent timeframes. Scores below 0.45 should SKIP.
 
-Think about:
-- Market regime (trend vs range vs breakout vs chop) in BOTH 15m and 1h.
+Also consider:
 - Recent volatility (ATR%) — high vol = tighter size via lower leverage.
 - Recent trade outcomes — if on a losing streak, be more selective.
-- The symbol's liquidity (volume_M) — low-volume symbols have worse \
-  slippage; prefer top-tier pairs for small trade sizes.
+- The symbol's liquidity (volume_M) — prefer top-tier pairs for small \
+  trade sizes to limit slippage.
 
 Reply with EXACTLY ONE JSON object, no commentary:
 
@@ -98,10 +112,10 @@ Reply with EXACTLY ONE JSON object, no commentary:
   "take_profits": [[<price>, <close_pct>], ...],
   "leverage": <int>,              // 0 = auto
   "confidence": <0..1>,
-  "reasoning": "<one sentence>"
+  "reasoning": "<one sentence — must reference HTF bias, MTF confirmation, LTF trigger>"
 }
 
-If SKIP: reply with {"action": "SKIP", "reasoning": "<why>"}.
+If SKIP: reply with {"action": "SKIP", "reasoning": "<why, referencing at least one TF>"}.
 """
 
 
@@ -129,40 +143,52 @@ class AIDecision:
         return None
 
 
+# Default number of recent candles to include per timeframe. Higher
+# timeframes get fewer candles since each carries more information.
+_DEFAULT_CANDLES_PER_TF: Dict[str, int] = {
+    "1d": 14,
+    "4h": 18,
+    "1h": 20,
+    "15m": 20,
+    "5m": 12,
+    "3m": 15,
+    "1m": 20,
+}
+
+
 @dataclass
 class _CandidateCtx:
     symbol: str
     ticker: TickerInfo
     filters: SymbolFilters
-    df15: pd.DataFrame
-    df1h: pd.DataFrame
+    # Top-down ordered mapping tf -> OHLCV DataFrame. Order matters:
+    # first key = highest TF, last = lowest (entry trigger).
+    dfs: Dict[str, pd.DataFrame] = field(default_factory=dict)
 
     def payload(self) -> Dict[str, Any]:
-        """Build the compact per-symbol payload sent to the AI."""
-        d15 = _enrich(self.df15)
-        d1h = _enrich(self.df1h)
-        if d15 is None or d1h is None:
+        """Build the compact per-symbol payload sent to the AI.
+
+        Emits timeframes under ``tf`` in top-down order so the model can
+        reason HTF -> MTF -> LTF naturally. Each TF entry bundles the
+        regime classification, indicator snapshot at the last closed bar,
+        and a short tail of recent OHLCV.
+        """
+        tf_blocks: List[Dict[str, Any]] = []
+        for tf, df in self.dfs.items():
+            enriched = _enrich(df)
+            if enriched is None or len(enriched) < 2:
+                continue
+            last = enriched.iloc[-2]
+            n_candles = _DEFAULT_CANDLES_PER_TF.get(tf, 15)
+            tf_blocks.append({
+                "tf": tf,
+                "regime": _regime_payload(classify_regime(df)),
+                "ind": _ind_snapshot(last),
+                "candles": _candles_tail(df, n_candles),
+            })
+
+        if not tf_blocks:
             return {}
-        # Last closed row (second-to-last; -1 is the forming bar).
-        last15 = d15.iloc[-2]
-        last1h = d1h.iloc[-2]
-
-        def _candles(df: pd.DataFrame, n: int):
-            # Take the n most recently CLOSED candles.
-            tail = df.iloc[-(n + 1):-1]
-            return [
-                [
-                    round(float(r.open), 8),
-                    round(float(r.high), 8),
-                    round(float(r.low), 8),
-                    round(float(r.close), 8),
-                    round(float(r.volume), 2),
-                ]
-                for r in tail.itertuples(index=False)
-            ]
-
-        reg15 = classify_regime(self.df15)
-        reg1h = classify_regime(self.df1h)
 
         return {
             "symbol": self.symbol,
@@ -177,13 +203,24 @@ class _CandidateCtx:
                 "min_qty": self.filters.min_qty,
                 "min_notional": self.filters.min_notional,
             },
-            "ind_15m": _ind_snapshot(last15),
-            "ind_1h": _ind_snapshot(last1h),
-            "regime_15m": _regime_payload(reg15),
-            "regime_1h": _regime_payload(reg1h),
-            "candles_15m": _candles(self.df15, 20),
-            "candles_1h": _candles(self.df1h, 12),
+            # Top-down: first entry = highest TF, last = lowest (entry trigger).
+            "tf": tf_blocks,
         }
+
+
+def _candles_tail(df: pd.DataFrame, n: int) -> List[List[float]]:
+    """Take the n most recently CLOSED candles as [o,h,l,c,v] rows."""
+    tail = df.iloc[-(n + 1):-1]
+    return [
+        [
+            round(float(r.open), 8),
+            round(float(r.high), 8),
+            round(float(r.low), 8),
+            round(float(r.close), 8),
+            round(float(r.volume), 2),
+        ]
+        for r in tail.itertuples(index=False)
+    ]
 
 
 def _enrich(df: pd.DataFrame) -> Optional[pd.DataFrame]:
