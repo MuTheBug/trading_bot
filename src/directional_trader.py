@@ -57,6 +57,9 @@ def _prescreen(
 
     The AI can only reason about the data we feed it, so this is just
     liquidity + "something's moving" gating. No directional bias here.
+
+    Symbols that have already moved very far in 24h are penalized: a
+    -20% day is usually an exhausted move, not an opportunity.
     """
     out: List[_Candidate] = []
     for t in tickers:
@@ -71,8 +74,16 @@ def _prescreen(
             continue
         rng = max(t.high_24h - t.low_24h, 0.0)
         range_pct = rng / t.price * 100.0 if t.price > 0 else 0.0
-        # Favour symbols that actually moved (either direction).
-        activity = abs(t.change_pct_24h) + 0.5 * range_pct
+        # Favour symbols that actually moved (either direction), but cap
+        # each contribution so extreme 24h movers don't dominate — they
+        # tend to be exhausted by the time the scan sees them.
+        abs_chg = abs(t.change_pct_24h)
+        activity = min(abs_chg, 10.0) + 0.5 * min(range_pct, 15.0)
+        # Additional multiplicative penalty for clearly-blown-off symbols.
+        if abs_chg > 20.0:
+            activity *= 0.3
+        elif abs_chg > 12.0:
+            activity *= 0.6
         score = activity * math.log10(max(t.volume_24h, 1.0))
         out.append(_Candidate(t.symbol, t, filt, score))
     out.sort(key=lambda c: c.score, reverse=True)
@@ -337,7 +348,69 @@ class DirectionalTrader:
             )
             return
 
+        # MTF alignment guard: don't LONG a symbol whose HTF is clearly
+        # bearish (or vice versa) unless it's explicitly flagged as a
+        # high-conviction reversal setup. This is the last line of defense
+        # against "buying the pump / shorting the dump" failures.
+        veto, veto_reason = self._mtf_veto(chosen, decision)
+        if veto:
+            logger.warning(
+                "MTF guard vetoed {} {}: {}",
+                decision.action, decision.symbol, veto_reason,
+            )
+            trade_log.log(
+                "skip", s=decision.symbol, why=f"mtf_veto:{veto_reason[:80]}",
+            )
+            return
+
         await self._open_from_decision(chosen, decision, equity)
+
+    def _mtf_veto(
+        self, cand: _CandidateCtx, decision: AIDecision,
+    ) -> Tuple[bool, str]:
+        """Reject trades that fight both the 24h tape and the HTF regime.
+
+        The veto only fires when the evidence is strong AND the AI didn't
+        explicitly flag a reversal. High-confidence reversal calls are
+        still allowed through.
+        """
+        from .strategy.regime import classify_regime  # local to avoid cycle
+
+        wants_long = decision.action == "OPEN_LONG"
+        reasoning = (decision.reasoning or "").lower()
+        reversal_flag = any(
+            w in reasoning for w in
+            ("reversal", "oversold", "overbought", "capitulat",
+             "exhaust", "bounce", "mean revert")
+        )
+
+        # 24h tape check. A LONG into a symbol down >10% over 24h is a
+        # "falling knife"; a SHORT into a +10% day is "shorting the tape".
+        chg24 = cand.ticker.change_pct_24h
+        if wants_long and chg24 <= -10.0 and not reversal_flag:
+            return True, f"24h {chg24:+.1f}% (falling knife)"
+        if (not wants_long) and chg24 >= 10.0 and not reversal_flag:
+            return True, f"24h {chg24:+.1f}% (chasing pump)"
+
+        # HTF + next-TF regime check. Need both top TFs to disagree.
+        opposing = 0
+        opposing_tfs: List[str] = []
+        for tf in list(cand.dfs.keys())[:2]:  # top two TFs (top-down)
+            snap = classify_regime(cand.dfs[tf])
+            if snap is None:
+                continue
+            dir_ok = (
+                snap.direction == "BOTH"
+                or (wants_long and snap.direction == "LONG")
+                or ((not wants_long) and snap.direction == "SHORT")
+            )
+            if not dir_ok and snap.confidence >= 0.5:
+                opposing += 1
+                opposing_tfs.append(f"{tf}:{snap.regime}")
+        if opposing >= 2 and not reversal_flag and decision.confidence < 0.75:
+            return True, f"HTF+MTF oppose ({', '.join(opposing_tfs)})"
+
+        return False, ""
 
     async def _open_from_decision(
         self, cand: _CandidateCtx, decision: AIDecision, equity: float,

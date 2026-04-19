@@ -96,6 +96,20 @@ Rules you MUST follow:
 - confidence: 0.0-1.0. A valid trade requires MTF alignment across at \
   least 2 of 3 adjacent timeframes. Scores below 0.45 should SKIP.
 
+DO NOT:
+- Buy pumps or short dumps. If `change_24h` is below -10%, do NOT open \
+  a LONG unless the HTF has clearly turned up and a multi-bar base has \
+  formed — treat the move as exhausted. Same rule inverted for SHORT \
+  when `change_24h` is above +10%.
+- Open in the direction of the final candle of a blowoff spike (a bar \
+  whose range is >3x the recent average). Wait for consolidation.
+- Take a trade against the HTF trend just because the LTF looks good. \
+  Counter-trend longs in a STRONG_DOWNTREND (and inverse) are only \
+  acceptable if you explicitly call out "reversal" with confluence: \
+  HTF bottom structure, bullish divergence, or capitulation wick.
+- Chase price extended far from the MTF EMA50 (> 3 ATR distance). \
+  Wait for a pullback.
+
 Also consider:
 - Recent volatility (ATR%) — high vol = tighter size via lower leverage.
 - Recent trade outcomes — if on a losing streak, be more selective.
