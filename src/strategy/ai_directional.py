@@ -116,6 +116,9 @@ Also consider:
 - The symbol's liquidity (volume_M) — prefer top-tier pairs for small \
   trade sizes to limit slippage.
 
+Keep any internal reasoning brief — emit the final JSON object \
+promptly. Do not produce long prose; your output budget is limited.
+
 Reply with EXACTLY ONE JSON object, no commentary:
 
 {
@@ -157,16 +160,18 @@ class AIDecision:
         return None
 
 
-# Default number of recent candles to include per timeframe. Higher
-# timeframes get fewer candles since each carries more information.
+# Default number of recent candles to include per timeframe. Each TF
+# block already carries its regime label + indicator snapshot, so the
+# raw OHLCV tail can stay short — the goal is to show the *shape* of
+# recent price action, not a full history.
 _DEFAULT_CANDLES_PER_TF: Dict[str, int] = {
-    "1d": 14,
-    "4h": 18,
-    "1h": 20,
-    "15m": 20,
-    "5m": 12,
-    "3m": 15,
-    "1m": 20,
+    "1d": 10,
+    "4h": 12,
+    "1h": 14,
+    "15m": 16,
+    "5m": 10,
+    "3m": 12,
+    "1m": 15,
 }
 
 
@@ -429,12 +434,31 @@ _JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
 
 
 def _extract_text(msg: Any) -> str:
+    """Collect text from text blocks; fall back to thinking blocks so we
+    can still salvage a JSON answer if the model only emitted thinking
+    (MiniMax will sometimes consume the whole output budget on reasoning
+    and never start a text block)."""
     content = getattr(msg, "content", None) or []
-    parts: List[str] = []
+    text_parts: List[str] = []
+    thinking_parts: List[str] = []
     for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(getattr(block, "text", "") or "")
-    return "".join(parts).strip()
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text_parts.append(getattr(block, "text", "") or "")
+        elif btype in ("thinking", "redacted_thinking"):
+            # Different SDKs expose the reasoning under different names.
+            t = (
+                getattr(block, "thinking", None)
+                or getattr(block, "text", None)
+                or getattr(block, "data", "")
+            )
+            if t:
+                thinking_parts.append(str(t))
+    out = "".join(text_parts).strip()
+    if out:
+        return out
+    # No text block — try the reasoning content as a best-effort fallback.
+    return "".join(thinking_parts).strip()
 
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
