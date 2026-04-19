@@ -73,8 +73,13 @@ directional:
   adx_weak: 18.0                # ADX in [weak, strong) => weak trend
   trail_atr_mult: 1.5           # trailing stop distance = mult * ATR
   trail_arm_atr: 1.0            # arm trailing after +N ATR of profit
+  trail_tighten_atr: 2.0        # once profit >= N ATR, use tighter trail
+  trail_tighten_mult: 0.75      # trailing mult after tightening (lock in more)
+  breakeven_profit_pct: 0.4     # move SL to entry once uPnL% reaches this (protects winners)
   breakeven_buffer_atr: 0.1     # breakeven stop = entry +/- buffer * ATR
-  breakeven_after_tp1: true     # move SL to breakeven after first TP hit
+  breakeven_after_tp1: true     # also move SL to breakeven after first TP hit
+  giveback_arm_pct: 1.0         # arm giveback exit once peak uPnL% reaches this
+  giveback_exit_pct: 0.6        # exit if we give back this much % from peak
   time_stop_hours: 24.0         # close if position still open after N hours
   max_loss_pct: 6.0             # hard cap % loss on open-equity
 

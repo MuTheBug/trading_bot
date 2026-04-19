@@ -104,7 +104,12 @@ def test_final_tp_exits_fully():
 def test_trailing_stop_tightens_only():
     async def go():
         ex = StubExchange()
-        pm = PositionManager(ex, trail_atr_mult=1.0, trail_arm_atr=0.5)
+        # Disable giveback + %-breakeven so this test isolates trailing logic.
+        pm = PositionManager(
+            ex, trail_atr_mult=1.0, trail_arm_atr=0.5,
+            giveback_arm_pct=0.0, giveback_exit_pct=0.0,
+            breakeven_profit_pct=0.0,
+        )
         pos = await _open(pm, ex, tps=[(200.0, 100.0)])  # won't hit TP
         pm.on_tick(105.0)   # arms trailing (+5 > 0.5*2 ATR)
         assert pos.trailing_armed
@@ -112,7 +117,7 @@ def test_trailing_stop_tightens_only():
         new_sl1 = pos.stop_loss
         assert new_sl1 > 95.0
         # Price dips but best stays at 110 -> stop must not loosen.
-        pm.on_tick(108.0)
+        pm.on_tick(108.5)
         assert pos.stop_loss == new_sl1
     run(go())
 
@@ -155,8 +160,97 @@ def test_short_position_stop_and_tp():
 def test_hold_when_inside_range():
     async def go():
         ex = StubExchange()
-        pm = PositionManager(ex)
+        # Disable %-based breakeven so a 0.5% move doesn't tighten the stop.
+        pm = PositionManager(ex, breakeven_profit_pct=0.0)
         await _open(pm, ex)
         res = pm.on_tick(100.5)
         assert res.action == "HOLD"
+        assert res.new_stop is None
+    run(go())
+
+
+def test_breakeven_on_profit_pct_before_tp1():
+    """A +0.5% move (below TP1 at 102) must still snap SL to entry."""
+    async def go():
+        ex = StubExchange()
+        pm = PositionManager(
+            ex, breakeven_profit_pct=0.4, breakeven_buffer_atr=0.0,
+            giveback_arm_pct=0.0,  # isolate BE behavior
+        )
+        pos = await _open(pm, ex)  # entry 100, SL 95, TP1 102
+        res = pm.on_tick(100.5)
+        assert res.action == "HOLD"
+        assert res.new_stop is not None
+        assert pos.stop_loss == pytest.approx(100.0)
+        assert pos.breakeven_moved
+        # And it must not loosen on a subsequent smaller gain.
+        pm.on_tick(100.2)
+        assert pos.stop_loss == pytest.approx(100.0)
+    run(go())
+
+
+def test_giveback_exit_fires_after_peak():
+    """Position hits +1.5% then retraces to +0.8% -> exit, don't round-trip."""
+    async def go():
+        ex = StubExchange()
+        pm = PositionManager(
+            ex, breakeven_profit_pct=0.0,  # disable BE to isolate giveback
+            giveback_arm_pct=1.0, giveback_exit_pct=0.6,
+        )
+        await _open(pm, ex, tps=[(200.0, 100.0)])  # TPs out of reach
+        # Ride to +1.5% peak.
+        pm.on_tick(101.5)
+        # Give back more than 0.6% from peak -> should exit.
+        res = pm.on_tick(100.8)
+        assert res.action == "EXIT"
+        assert res.reason == "GIVEBACK"
+    run(go())
+
+
+def test_giveback_disarmed_below_arm_threshold():
+    """If peak never reached arm_pct, giveback must NOT fire."""
+    async def go():
+        ex = StubExchange()
+        pm = PositionManager(
+            ex, breakeven_profit_pct=0.0,
+            giveback_arm_pct=2.0, giveback_exit_pct=0.6,
+        )
+        await _open(pm, ex, tps=[(200.0, 100.0)])
+        pm.on_tick(101.0)   # peak +1%, below 2% arm
+        res = pm.on_tick(100.2)  # gave back 0.8%
+        assert res.action == "HOLD"
+    run(go())
+
+
+def test_trailing_tightens_after_deep_profit():
+    """At +3 ATR profit the trail mult tightens from 1.5 -> 0.75 ATR."""
+    async def go():
+        ex = StubExchange()
+        pm = PositionManager(
+            ex, trail_atr_mult=1.5, trail_arm_atr=0.5,
+            trail_tighten_atr=2.0, trail_tighten_mult=0.75,
+            breakeven_profit_pct=0.0, giveback_arm_pct=0.0,
+        )
+        pos = await _open(pm, ex, tps=[(500.0, 100.0)])  # out-of-reach TP
+        # ATR = 2.0. Push price to +6 (>= 2 ATR profit) to arm tightened trail.
+        pm.on_tick(106.0)
+        # Expected tightened stop = best - 0.75*ATR = 106 - 1.5 = 104.5
+        assert pos.stop_loss == pytest.approx(104.5)
+    run(go())
+
+
+def test_short_giveback_exit():
+    async def go():
+        ex = StubExchange()
+        pm = PositionManager(
+            ex, breakeven_profit_pct=0.0,
+            giveback_arm_pct=1.0, giveback_exit_pct=0.6,
+        )
+        # Short at 100, SL 105, TPs far.
+        await _open(pm, ex, side="SHORT", entry=100.0, sl=105.0,
+                    tps=[(50.0, 100.0)])
+        pm.on_tick(98.5)  # peak +1.5% short profit
+        res = pm.on_tick(99.2)  # give back 0.7% from peak
+        assert res.action == "EXIT"
+        assert res.reason == "GIVEBACK"
     run(go())

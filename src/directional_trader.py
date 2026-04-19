@@ -88,10 +88,12 @@ class DirectionalTrader:
         state: StateStore,
         config: BotConfig,
         secrets: Secrets,
+        notifier: Any = None,
     ) -> None:
         self.ex = exchange
         self.state = state
         self.cfg = config
+        self.notifier = notifier
         self.risk = RiskManager(config.risk, config.grid)
         self.ai_strategy = AIDirectionalStrategy(
             ai_cfg=config.ai,
@@ -99,14 +101,20 @@ class DirectionalTrader:
             api_key=secrets.ai_api_key,
             base_url=secrets.ai_base_url,
         )
+        d = config.directional
         self.pm = PositionManager(
             exchange,
-            trail_atr_mult=config.directional.trail_atr_mult,
-            trail_arm_atr=config.directional.trail_arm_atr,
-            breakeven_buffer_atr=config.directional.breakeven_buffer_atr,
-            time_stop_hours=config.directional.time_stop_hours,
-            max_loss_pct=config.directional.max_loss_pct,
-            breakeven_after_tp1=config.directional.breakeven_after_tp1,
+            trail_atr_mult=d.trail_atr_mult,
+            trail_arm_atr=d.trail_arm_atr,
+            trail_tighten_atr=d.trail_tighten_atr,
+            trail_tighten_mult=d.trail_tighten_mult,
+            breakeven_buffer_atr=d.breakeven_buffer_atr,
+            breakeven_profit_pct=d.breakeven_profit_pct,
+            breakeven_after_tp1=d.breakeven_after_tp1,
+            giveback_arm_pct=d.giveback_arm_pct,
+            giveback_exit_pct=d.giveback_exit_pct,
+            time_stop_hours=d.time_stop_hours,
+            max_loss_pct=d.max_loss_pct,
         )
         self._last_scan: Optional[datetime] = None
         self._recent_outcomes: List[Dict[str, Any]] = []
@@ -198,11 +206,23 @@ class DirectionalTrader:
             )
             return
         if result.action == "EXIT":
-            rp = pos.realised_pnl
+            entry = pos.entry_price
+            # Predict final PnL (realised on partials + about-to-close leg).
+            final_leg = (
+                (mark - entry) * pos.remaining_qty if pos.side == "LONG"
+                else (entry - mark) * pos.remaining_qty
+            )
+            projected_pnl = pos.realised_pnl + final_leg
+            peak_pct = pos.peak_profit_pct
             symbol = pos.symbol
             side = pos.side
+            qty = pos.original_qty
             await self.pm.close(result.reason or "MANUAL", mark)
-            self._record_exit(symbol, side, mark, result.reason, rp)
+            self._record_exit(symbol, side, mark, result.reason, projected_pnl)
+            await self._notify_close(
+                symbol, side, qty, entry, mark, result.reason,
+                projected_pnl, peak_pct,
+            )
 
     def _record_exit(
         self, symbol: str, side: str, mark: float, reason, realised_pnl: float,
@@ -403,6 +423,61 @@ class DirectionalTrader:
             conf=f"{decision.confidence:.2f}",
             why=decision.reasoning[:80],
         )
+        await self._notify_open(
+            cand.symbol, side, tp.qty, entry, stop_loss,
+            take_profits, tp.leverage, decision.confidence,
+            decision.reasoning,
+        )
+
+    # ---------------- notifications ----------------
+
+    async def _notify_open(
+        self, symbol: str, side: str, qty: float, entry: float,
+        stop_loss: float, take_profits: List[Tuple[float, float]],
+        leverage: int, confidence: float, reasoning: str,
+    ) -> None:
+        if self.notifier is None:
+            return
+        sl_pct = abs(entry - stop_loss) / entry * 100.0 if entry > 0 else 0.0
+        arrow = "\U0001f7e2" if side == "LONG" else "\U0001f534"
+        tp_lines = "\n".join(
+            f"  TP{i+1}: {p:.6f} ({pct:.0f}%)"
+            for i, (p, pct) in enumerate(take_profits)
+        )
+        text = (
+            f"{arrow} <b>OPEN {side}</b> {symbol}\n"
+            f"Entry: <code>{entry:.6f}</code>  Qty: <code>{qty:.6f}</code>\n"
+            f"Leverage: <b>{leverage}x</b>  Conf: {confidence:.2f}\n"
+            f"SL: <code>{stop_loss:.6f}</code> ({sl_pct:.2f}%)\n"
+            f"{tp_lines}\n"
+            f"<i>{reasoning[:160]}</i>"
+        )
+        try:
+            await self.notifier.send(text)
+        except Exception as e:
+            logger.debug("notify_open failed: {}", e)
+
+    async def _notify_close(
+        self, symbol: str, side: str, qty: float, entry: float, exit_price: float,
+        reason: Any, pnl: float, peak_pct: float,
+    ) -> None:
+        if self.notifier is None:
+            return
+        move_pct = (
+            (exit_price - entry) / entry * 100.0 if side == "LONG"
+            else (entry - exit_price) / entry * 100.0
+        ) if entry > 0 else 0.0
+        emoji = "\U0001f7e2" if pnl > 0 else ("\U0001f534" if pnl < 0 else "\u26aa")
+        text = (
+            f"{emoji} <b>CLOSE {side}</b> {symbol} ({reason})\n"
+            f"Entry: <code>{entry:.6f}</code>  Exit: <code>{exit_price:.6f}</code>\n"
+            f"Move: {move_pct:+.2f}%  Peak: {peak_pct:+.2f}%\n"
+            f"PnL: <b>{pnl:+.4f} USDT</b>"
+        )
+        try:
+            await self.notifier.send(text)
+        except Exception as e:
+            logger.debug("notify_close failed: {}", e)
 
 
 __all__ = ["DirectionalTrader"]

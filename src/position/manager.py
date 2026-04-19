@@ -34,7 +34,7 @@ from ..exchange.base import (
 Side = Literal["LONG", "SHORT"]
 ExitReason = Literal[
     "STOP_LOSS", "TRAILING_STOP", "TAKE_PROFIT_FINAL",
-    "TIME_STOP", "MAX_LOSS", "MANUAL", "REGIME_FLIP",
+    "TIME_STOP", "MAX_LOSS", "MANUAL", "REGIME_FLIP", "GIVEBACK",
 ]
 Action = Literal["HOLD", "PARTIAL_CLOSE", "EXIT"]
 
@@ -64,6 +64,8 @@ class ManagedPosition:
     best_price: float = 0.0              # peak (LONG) or trough (SHORT)
     trailing_armed: bool = False
     breakeven_moved: bool = False
+    peak_profit_pct: float = 0.0         # highest uPnL% reached
+    giveback_armed: bool = False         # True once peak hit arm threshold
     realised_pnl: float = 0.0
     fees_paid: float = 0.0
 
@@ -119,18 +121,28 @@ class PositionManager:
         *,
         trail_atr_mult: float = 1.5,
         trail_arm_atr: float = 1.0,           # arm trailing after +1 ATR of profit
+        trail_tighten_atr: float = 2.0,       # once profit >= N ATR, tighten
+        trail_tighten_mult: float = 0.75,     # trailing mult after tightening
         breakeven_buffer_atr: float = 0.1,    # BE stop at entry +/- this*ATR
+        breakeven_profit_pct: float = 0.4,    # move SL to BE once uPnL% >= this
+        breakeven_after_tp1: bool = True,
+        giveback_arm_pct: float = 1.0,        # arm giveback at this peak uPnL%
+        giveback_exit_pct: float = 0.6,       # exit if give back this from peak
         time_stop_hours: float = 24.0,
         max_loss_pct: float = 6.0,            # hard cap as % of equity at open
-        breakeven_after_tp1: bool = True,
     ) -> None:
         self.ex = exchange
         self.trail_atr_mult = trail_atr_mult
         self.trail_arm_atr = trail_arm_atr
+        self.trail_tighten_atr = trail_tighten_atr
+        self.trail_tighten_mult = trail_tighten_mult
         self.be_buffer_atr = breakeven_buffer_atr
+        self.breakeven_profit_pct = breakeven_profit_pct
+        self.breakeven_after_tp1 = breakeven_after_tp1
+        self.giveback_arm_pct = giveback_arm_pct
+        self.giveback_exit_pct = giveback_exit_pct
         self.time_stop_hours = time_stop_hours
         self.max_loss_pct = max_loss_pct
-        self.breakeven_after_tp1 = breakeven_after_tp1
         self._position: Optional[ManagedPosition] = None
         self._equity_at_open: float = 0.0
 
@@ -260,13 +272,16 @@ class PositionManager:
         if pos is None or pos.remaining_qty <= 0:
             return TickResult("HOLD")
 
-        # Track best excursion.
+        # Track best excursion and peak unrealised %.
         if pos.side == "LONG":
             if mark > pos.best_price:
                 pos.best_price = mark
         else:
             if mark < pos.best_price or pos.best_price == 0:
                 pos.best_price = mark
+        cur_pct = pos.unrealised_pct(mark)
+        if cur_pct > pos.peak_profit_pct:
+            pos.peak_profit_pct = cur_pct
 
         # 1) Hard stop-loss.
         if pos.side == "LONG" and mark <= pos.stop_loss:
@@ -313,6 +328,34 @@ class PositionManager:
                                   pos.remaining_qty, new_stop=new_stop)
             return TickResult("PARTIAL_CLOSE", None, close_qty, new_stop=new_stop)
 
+        # 4b) Giveback exit — once peak profit crosses the arm threshold,
+        # exit if we hand back more than `giveback_exit_pct` from that peak.
+        # Protects winning trades from round-tripping into losers.
+        if self.giveback_arm_pct > 0 and self.giveback_exit_pct > 0:
+            if not pos.giveback_armed and pos.peak_profit_pct >= self.giveback_arm_pct:
+                pos.giveback_armed = True
+            if pos.giveback_armed and (pos.peak_profit_pct - cur_pct) >= self.giveback_exit_pct:
+                return TickResult("EXIT", "GIVEBACK", pos.remaining_qty)
+
+        # 4c) Percent-gain breakeven — lock in "no-loss" early, before TP1.
+        if (
+            not pos.breakeven_moved
+            and self.breakeven_profit_pct > 0
+            and cur_pct >= self.breakeven_profit_pct
+        ):
+            be = self._breakeven_stop(pos)
+            if be is not None:
+                if pos.side == "LONG" and be > pos.stop_loss:
+                    pos.stop_loss = be
+                    pos.breakeven_moved = True
+                    pos.trailing_armed = True
+                    return TickResult("HOLD", new_stop=be)
+                if pos.side == "SHORT" and be < pos.stop_loss:
+                    pos.stop_loss = be
+                    pos.breakeven_moved = True
+                    pos.trailing_armed = True
+                    return TickResult("HOLD", new_stop=be)
+
         # 5) Arm trailing stop once we're +trail_arm_atr in profit.
         if not pos.trailing_armed:
             if pos.side == "LONG":
@@ -347,7 +390,21 @@ class PositionManager:
         return _round_tick(price, pos.price_tick)
 
     def _trailing_stop(self, pos: ManagedPosition) -> Optional[float]:
-        dist = self.trail_atr_mult * pos.atr_at_entry
+        # Tighten the trailing distance once profit exceeds a threshold,
+        # so that deeper winners lock in more of their gain.
+        if pos.atr_at_entry > 0:
+            if pos.side == "LONG":
+                profit_atr = (pos.best_price - pos.entry_price) / pos.atr_at_entry
+            else:
+                profit_atr = (pos.entry_price - pos.best_price) / pos.atr_at_entry
+        else:
+            profit_atr = 0.0
+        mult = (
+            self.trail_tighten_mult
+            if profit_atr >= self.trail_tighten_atr
+            else self.trail_atr_mult
+        )
+        dist = mult * pos.atr_at_entry
         if pos.side == "LONG":
             return _round_tick(pos.best_price - dist, pos.price_tick)
         return _round_tick(pos.best_price + dist, pos.price_tick)

@@ -166,8 +166,13 @@ class DirectionalConfig(BaseModel):
     # Position management
     trail_atr_mult: float = 1.5
     trail_arm_atr: float = 1.0             # arm trailing after +1 ATR profit
+    trail_tighten_atr: float = 2.0         # once profit >= N ATR, use tighter trail
+    trail_tighten_mult: float = 0.75       # trailing mult after tightening
+    breakeven_profit_pct: float = 0.4      # move SL to BE once uPnL% >= this
     breakeven_buffer_atr: float = 0.1
     breakeven_after_tp1: bool = True
+    giveback_arm_pct: float = 1.0          # arm giveback protection at this peak uPnL%
+    giveback_exit_pct: float = 0.6         # exit if we give back this much from peak
     time_stop_hours: float = 24.0
     max_loss_pct: float = 6.0              # hard cap % of open-equity
 

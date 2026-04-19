@@ -49,16 +49,19 @@ class TradingBot:
         self.ai_strategy = self._build_ai_strategy()
         # Directional trader is built lazily for grid-mode users so they
         # don't pay the import cost of the regime stack.
-        self.directional: Optional[DirectionalTrader] = (
-            DirectionalTrader(self.exchange, self.state, config, secrets)
-            if config.trading_mode == "directional" else None
-        )
         self.telegram = TelegramNotifier(
             token=secrets.telegram_bot_token,
             chat_id=secrets.telegram_chat_id,
             state=self.state,
             bot_ref=self,
             enabled=config.telegram.enabled,
+        )
+        self.directional: Optional[DirectionalTrader] = (
+            DirectionalTrader(
+                self.exchange, self.state, config, secrets,
+                notifier=self.telegram,
+            )
+            if config.trading_mode == "directional" else None
         )
         self._running = False
         self._stop_event = asyncio.Event()
