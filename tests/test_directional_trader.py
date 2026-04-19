@@ -114,3 +114,94 @@ def test_veto_passes_aligned_setup():
                      stop_loss=125.0, confidence=0.6, reasoning="trend continuation")
     veto, _ = _Trader()._mtf_veto(ctx, dec)
     assert not veto
+
+
+# --- pullback veto ----------------------------------------------------------
+
+
+def _pullback_long_closes():
+    """80 bars: long uptrend, then a small pullback in the last ~4 bars."""
+    trend = np.linspace(100, 120, 76)
+    pull = np.array([120.0, 118.5, 117.0, 116.2])
+    return np.concatenate([trend, pull])
+
+
+def _pullback_short_closes():
+    """80 bars: long downtrend, then a small bounce in the last ~4 bars."""
+    trend = np.linspace(120, 100, 76)
+    bounce = np.array([100.0, 101.5, 103.0, 103.8])
+    return np.concatenate([trend, bounce])
+
+
+def test_pullback_allows_long_at_pullback_low():
+    """LONG where LTF just pulled back ~4 bars -> allowed."""
+    closes = _pullback_long_closes()
+    ctx = _CandidateCtx(
+        symbol="X", ticker=_ticker(price=116.2, chg=3.0), filters=_filters(),
+        dfs={"1d": _ohlcv(np.linspace(100, 120, 80)),
+             "15m": _ohlcv(closes)},
+    )
+    dec = AIDecision(action="OPEN_LONG", symbol="X", entry=116.2,
+                     stop_loss=114.0, confidence=0.6,
+                     reasoning="HTF up, LTF pulled back to EMA20")
+    veto, _ = _Trader()._pullback_veto(ctx, dec)
+    assert not veto
+
+
+def test_pullback_blocks_long_chasing_breakout():
+    """LONG at the very top of a straight-line rally -> vetoed (chasing)."""
+    closes = np.linspace(100, 130, 80)
+    ctx = _CandidateCtx(
+        symbol="X", ticker=_ticker(price=130.0, chg=3.0), filters=_filters(),
+        dfs={"1d": _ohlcv(closes), "15m": _ohlcv(closes)},
+    )
+    dec = AIDecision(action="OPEN_LONG", symbol="X", entry=130.0,
+                     stop_loss=125.0, confidence=0.6,
+                     reasoning="trend continuation")
+    veto, why = _Trader()._pullback_veto(ctx, dec)
+    assert veto
+    assert "pullback" in why.lower() or "chas" in why.lower()
+
+
+def test_pullback_allows_short_at_bounce_high():
+    """SHORT where LTF just bounced ~4 bars -> allowed."""
+    closes = _pullback_short_closes()
+    ctx = _CandidateCtx(
+        symbol="X", ticker=_ticker(price=103.8, chg=-3.0), filters=_filters(),
+        dfs={"1d": _ohlcv(np.linspace(120, 100, 80)),
+             "15m": _ohlcv(closes)},
+    )
+    dec = AIDecision(action="OPEN_SHORT", symbol="X", entry=103.8,
+                     stop_loss=106.0, confidence=0.6,
+                     reasoning="HTF down, LTF bounced to EMA20")
+    veto, _ = _Trader()._pullback_veto(ctx, dec)
+    assert not veto
+
+
+def test_pullback_blocks_short_at_bottom_of_dump():
+    """SHORT at the lowest print of a straight-line dump -> vetoed."""
+    closes = np.linspace(120, 100, 80)
+    ctx = _CandidateCtx(
+        symbol="X", ticker=_ticker(price=100.0, chg=-5.0), filters=_filters(),
+        dfs={"1d": _ohlcv(closes), "15m": _ohlcv(closes)},
+    )
+    dec = AIDecision(action="OPEN_SHORT", symbol="X", entry=100.0,
+                     stop_loss=103.0, confidence=0.6,
+                     reasoning="trend continuation")
+    veto, why = _Trader()._pullback_veto(ctx, dec)
+    assert veto
+    assert "pullback" in why.lower() or "chas" in why.lower()
+
+
+def test_pullback_exempts_reversal_call():
+    """Reversal-flagged entries bypass the pullback gate."""
+    closes = np.linspace(120, 100, 80)
+    ctx = _CandidateCtx(
+        symbol="X", ticker=_ticker(price=100.0, chg=-15.0), filters=_filters(),
+        dfs={"1d": _ohlcv(closes), "15m": _ohlcv(closes)},
+    )
+    dec = AIDecision(action="OPEN_LONG", symbol="X", entry=100.0,
+                     stop_loss=98.0, confidence=0.7,
+                     reasoning="capitulation wick + oversold reversal")
+    veto, _ = _Trader()._pullback_veto(ctx, dec)
+    assert not veto

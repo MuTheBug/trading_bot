@@ -28,6 +28,7 @@ from loguru import logger
 from . import trade_log
 from .config import BotConfig, Secrets
 from .exchange.base import ExchangeInterface, SymbolFilters, TickerInfo
+from .indicators import atr as atr_ind, rsi as rsi_ind
 from .position.manager import PositionManager
 from .risk.leverage import TradePlan, adaptive_leverage, compute_trade_plan
 from .risk.risk_manager import RiskManager
@@ -363,6 +364,21 @@ class DirectionalTrader:
             )
             return
 
+        # Pullback gate: only enter at the bottom of a pullback (LONG) or
+        # the top of a pullback (SHORT). Chasing mid-move is the #1 reason
+        # winners round-trip into losers.
+        veto, veto_reason = self._pullback_veto(chosen, decision)
+        if veto:
+            logger.warning(
+                "Pullback guard vetoed {} {}: {}",
+                decision.action, decision.symbol, veto_reason,
+            )
+            trade_log.log(
+                "skip", s=decision.symbol,
+                why=f"pullback_veto:{veto_reason[:80]}",
+            )
+            return
+
         await self._open_from_decision(chosen, decision, equity)
 
     def _mtf_veto(
@@ -409,6 +425,94 @@ class DirectionalTrader:
                 opposing_tfs.append(f"{tf}:{snap.regime}")
         if opposing >= 2 and not reversal_flag and decision.confidence < 0.75:
             return True, f"HTF+MTF oppose ({', '.join(opposing_tfs)})"
+
+        return False, ""
+
+    def _pullback_veto(
+        self, cand: _CandidateCtx, decision: AIDecision,
+    ) -> Tuple[bool, str]:
+        """Require the entry to sit at a pullback bottom (LONG) or top (SHORT).
+
+        Uses the LOWEST timeframe in the payload (the entry-trigger TF) to
+        measure where price sits within the recent swing:
+
+        * pullback depth  = recent_high - recent_low (over last N closed bars)
+        * distance to extreme we're buying/selling, in ATR units
+
+        A LONG is accepted only when price has pulled back at least 0.5 ATR
+        from the recent high AND now sits within ~1 ATR of the recent low,
+        with LTF RSI not already overbought. SHORT is the inverse.
+
+        Reversal calls (AI flagged the setup as oversold/exhaustion/etc) are
+        exempt — they're explicitly not trend-continuation pullbacks.
+        """
+        wants_long = decision.action == "OPEN_LONG"
+        reasoning = (decision.reasoning or "").lower()
+        reversal_flag = any(
+            w in reasoning for w in
+            ("reversal", "capitulat", "exhaust", "bottoming", "topping out")
+        )
+        if reversal_flag:
+            return False, ""
+
+        if not cand.dfs:
+            return False, ""
+        ltf_name = list(cand.dfs.keys())[-1]
+        df = cand.dfs[ltf_name]
+        if df is None or len(df) < 20:
+            return False, ""
+
+        # Work off the last CLOSED bar to keep the check reproducible.
+        closed = df.iloc[:-1] if len(df) > 1 else df
+        if len(closed) < 15:
+            return False, ""
+
+        atr_series = atr_ind(closed, 14)
+        rsi_series = rsi_ind(closed["close"], 14)
+        if atr_series.iloc[-1] != atr_series.iloc[-1]:  # NaN check
+            return False, ""
+        atr_val = float(atr_series.iloc[-1])
+        last_rsi = float(rsi_series.iloc[-1])
+        last_close = float(closed["close"].iloc[-1])
+        if atr_val <= 0 or last_close <= 0:
+            return False, ""
+
+        window = closed.iloc[-10:]
+        recent_high = float(window["high"].max())
+        recent_low = float(window["low"].min())
+        dist_from_high_atr = (recent_high - last_close) / atr_val
+        dist_from_low_atr = (last_close - recent_low) / atr_val
+
+        if wants_long:
+            if dist_from_high_atr < 0.5:
+                return True, (
+                    f"no pullback: only {dist_from_high_atr:.2f} ATR below "
+                    f"recent high on {ltf_name}"
+                )
+            if dist_from_low_atr > 1.2:
+                return True, (
+                    f"chasing: {dist_from_low_atr:.2f} ATR above recent "
+                    f"{ltf_name} low — wait for next pullback"
+                )
+            if last_rsi > 65.0:
+                return True, (
+                    f"LTF RSI {last_rsi:.1f} overbought — not a pullback low"
+                )
+        else:
+            if dist_from_low_atr < 0.5:
+                return True, (
+                    f"no pullback: only {dist_from_low_atr:.2f} ATR above "
+                    f"recent low on {ltf_name}"
+                )
+            if dist_from_high_atr > 1.2:
+                return True, (
+                    f"chasing: {dist_from_high_atr:.2f} ATR below recent "
+                    f"{ltf_name} high — wait for next bounce"
+                )
+            if last_rsi < 35.0:
+                return True, (
+                    f"LTF RSI {last_rsi:.1f} oversold — not a pullback high"
+                )
 
         return False, ""
 

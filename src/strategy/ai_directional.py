@@ -96,6 +96,26 @@ Rules you MUST follow:
 - confidence: 0.0-1.0. A valid trade requires MTF alignment across at \
   least 2 of 3 adjacent timeframes. Scores below 0.45 should SKIP.
 
+ENTRY DISCIPLINE — PULLBACKS ONLY:
+The ONLY acceptable entries are pullback entries (or explicit, \
+well-argued reversals). Do not enter mid-move.
+
+- LONG: HTF trend must be up. On the LTF, price must have pulled back \
+  from a recent swing high toward EMA20/EMA50 or a structural support, \
+  and must now be AT the pullback low (within ~1 ATR), ideally with a \
+  bullish rejection candle (lower wick, green close) or LTF RSI \
+  turning up from the 35-50 zone. If the last 3-5 LTF candles are \
+  straight green / each a higher high, the pullback is over — SKIP \
+  and wait for the next one.
+- SHORT: inverse. HTF trend down; price bounced toward EMA20/EMA50 or \
+  overhead resistance and is now AT the bounce high, with a bearish \
+  rejection candle or LTF RSI rolling down from the 50-65 zone. If \
+  the last 3-5 LTF candles are straight red / each a lower low, the \
+  bounce is over — SKIP.
+
+If you cannot locate a clear pullback low (for LONG) or pullback high \
+(for SHORT) on the LTF within ~1 ATR of the current price, SKIP.
+
 DO NOT:
 - Buy pumps or short dumps. If `change_24h` is below -10%, do NOT open \
   a LONG unless the HTF has clearly turned up and a multi-bar base has \
@@ -109,6 +129,9 @@ DO NOT:
   HTF bottom structure, bullish divergence, or capitulation wick.
 - Chase price extended far from the MTF EMA50 (> 3 ATR distance). \
   Wait for a pullback.
+- Enter a trade where the current price is already near the recent \
+  swing high (for LONG) or swing low (for SHORT) of the LTF window — \
+  that's the exit, not the entry.
 
 Also consider:
 - Recent volatility (ATR%) — high vol = tighter size via lower leverage.
@@ -129,7 +152,7 @@ Reply with EXACTLY ONE JSON object, no commentary:
   "take_profits": [[<price>, <close_pct>], ...],
   "leverage": <int>,              // 0 = auto
   "confidence": <0..1>,
-  "reasoning": "<one sentence — must reference HTF bias, MTF confirmation, LTF trigger>"
+  "reasoning": "<one sentence — must state: HTF bias, MTF confirmation, and the LTF pullback evidence (where the swing low/high is and why now is the entry)>"
 }
 
 If SKIP: reply with {"action": "SKIP", "reasoning": "<why, referencing at least one TF>"}.
