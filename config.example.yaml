@@ -64,9 +64,11 @@ directional:
   base_leverage: 3              # preferred leverage in neutral conditions
   min_leverage: 1
   max_leverage: 20              # hard cap
-  max_margin_pct: 85.0          # margin must not exceed % of equity
+  max_margin_pct: 85.0          # soft cap — normal trades keep margin under this % of equity
+  hard_margin_pct: 98.0         # hard cap — expensive assets (high min_notional) may use up to this % (leaves ~2% for fees)
   min_volume_usd: 50000000      # minimum 24h volume to consider a symbol
-  scan_top_n: 10                # how many candidates to send to the AI per scan (fewer = faster + cheaper tokens)
+  scan_top_n: 0                 # 0 = scan every liquid symbol one-by-one; >0 caps to the top-N most active
+  scan_max_ai_calls: 120        # safety cap on AI calls per scan pass (stops early once a trade is found)
   scan_interval_seconds: 60     # min gap between scans when flat
   min_confidence: 0.45          # reject the AI's setup if its confidence < this
   # Multi-timeframe analysis. The AI receives each candidate's data for

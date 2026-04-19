@@ -151,11 +151,13 @@ class DirectionalConfig(BaseModel):
     base_leverage: int = 3                 # preferred leverage when conditions neutral
     min_leverage: int = 1
     max_leverage: int = 20                 # hard cap
-    max_margin_pct: float = 85.0           # margin must not exceed this % of equity
+    max_margin_pct: float = 85.0           # soft cap — normal trades stay under this % of equity
+    hard_margin_pct: float = 98.0          # hard cap — expensive assets can use up to this % (leaves ~2% for fees)
 
     # Scanning
     min_volume_usd: float = 50_000_000
-    scan_top_n: int = 10                   # candidates sent to the AI per scan
+    scan_top_n: int = 0                    # 0 = scan every liquid symbol (one-by-one AI call)
+    scan_max_ai_calls: int = 120           # safety cap on AI calls per scan pass
     scan_interval_seconds: int = 60        # min gap between scans when flat
     min_confidence: float = 0.45           # reject if the AI's self-confidence is below this
     # Multi-timeframe analysis: top-down ordered list of timeframes the

@@ -49,6 +49,17 @@ def test_prescreen_penalizes_extreme_moves():
     assert ranked[1].symbol == "ADUMPUSDT"
 
 
+def test_prescreen_top_n_zero_returns_all():
+    """top_n <= 0 disables the cap — every liquid symbol passes through."""
+    tickers = [_ticker(f"S{i}USDT", price=1.0, chg=1.0 + i * 0.1, vol=1e9)
+               for i in range(25)]
+    fils = {t.symbol: _filters(t.symbol) for t in tickers}
+    ranked_all = _prescreen(tickers, fils, min_volume_usd=1e7, top_n=0)
+    ranked_capped = _prescreen(tickers, fils, min_volume_usd=1e7, top_n=5)
+    assert len(ranked_all) == 25
+    assert len(ranked_capped) == 5
+
+
 def test_veto_falling_knife_long():
     """LONG a -19% day with no reversal flag -> vetoed."""
     ctx = _CandidateCtx(

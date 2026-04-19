@@ -56,6 +56,10 @@ def _prescreen(
 ) -> List[_Candidate]:
     """Filter + rank candidates by activity before calling the AI.
 
+    Set ``top_n <= 0`` to disable the cap and return every liquid symbol
+    (still sorted by activity score so the most interesting ones are
+    scanned first).
+
     The AI can only reason about the data we feed it, so this is just
     liquidity + "something's moving" gating. No directional bias here.
 
@@ -88,6 +92,8 @@ def _prescreen(
         score = activity * math.log10(max(t.volume_24h, 1.0))
         out.append(_Candidate(t.symbol, t, filt, score))
     out.sort(key=lambda c: c.score, reverse=True)
+    if top_n is None or top_n <= 0:
+        return out
     return out[:top_n]
 
 
@@ -258,6 +264,31 @@ class DirectionalTrader:
 
     # ---------------- scan & open ----------------
 
+    async def _build_mtf_ctx(
+        self, cand: _Candidate,
+    ) -> Optional[_CandidateCtx]:
+        """Fetch klines for every configured MTF timeframe for one symbol.
+
+        Returns None if any timeframe fails or has too few bars.
+        """
+        mtf_tfs = self.cfg.directional.mtf_timeframes or ["1h", "15m"]
+        dfs: Dict[str, Any] = {}
+        for tf in mtf_tfs:
+            try:
+                df = await self.ex.get_klines(cand.symbol, tf, 150)
+            except Exception as e:
+                logger.debug("klines failed for {} {}: {}", cand.symbol, tf, e)
+                return None
+            if df is None or len(df) < 60:
+                return None
+            dfs[tf] = df
+        if not dfs:
+            return None
+        return _CandidateCtx(
+            symbol=cand.symbol, ticker=cand.ticker, filters=cand.filters,
+            dfs=dfs,
+        )
+
     async def _scan_and_open(self, equity: float) -> None:
         try:
             tickers = await self.ex.get_all_tickers()
@@ -280,106 +311,79 @@ class DirectionalTrader:
             logger.info("All candidates in cooldown")
             return
 
-        # Build AI context — fetch klines for every configured timeframe
-        # (top-down MTF). Skip the candidate if any TF has insufficient data.
-        mtf_tfs = self.cfg.directional.mtf_timeframes or ["1h", "15m"]
-        ctxs: List[_CandidateCtx] = []
-        for cand in candidates:
-            dfs: Dict[str, Any] = {}
-            ok = True
-            for tf in mtf_tfs:
-                try:
-                    df = await self.ex.get_klines(cand.symbol, tf, 150)
-                except Exception as e:
-                    logger.debug("klines failed for {} {}: {}", cand.symbol, tf, e)
-                    ok = False
-                    break
-                if df is None or len(df) < 60:
-                    ok = False
-                    break
-                dfs[tf] = df
-            if not ok or not dfs:
-                continue
-            ctxs.append(_CandidateCtx(
-                symbol=cand.symbol, ticker=cand.ticker, filters=cand.filters,
-                dfs=dfs,
-            ))
-
-        if not ctxs:
-            logger.info("No candidates with sufficient kline history")
-            return
+        max_calls = self.cfg.directional.scan_max_ai_calls
+        if max_calls and max_calls > 0:
+            candidates = candidates[:max_calls]
 
         logger.info(
-            "AI directional scan: {} candidates, balance={:.4f}",
-            len(ctxs), equity,
+            "AI directional scan: iterating {} candidates one-by-one, balance={:.4f}",
+            len(candidates), equity,
         )
-        decision = await self.ai_strategy.decide(
-            candidates=ctxs,
-            balance=equity,
-            recent_outcomes=self._recent_outcomes,
-        )
-        if decision is None:
-            logger.warning("AI returned no decision — skipping")
-            trade_log.log("skip", why="ai_no_decision")
-            return
-        if not decision.is_trade:
-            logger.info("AI decided SKIP: {}", decision.reasoning)
-            trade_log.log("skip", why=f"ai_skip:{decision.reasoning[:80]}")
-            return
-        if decision.confidence < self.cfg.directional.min_confidence:
-            logger.info(
-                "AI confidence {:.2f} below threshold {:.2f} — skipping",
-                decision.confidence, self.cfg.directional.min_confidence,
+
+        # Walk candidates in score order. Per-symbol AI call; first one
+        # that produces a high-confidence, veto-clean trade wins.
+        min_conf = self.cfg.directional.min_confidence
+        for cand in candidates:
+            ctx = await self._build_mtf_ctx(cand)
+            if ctx is None:
+                continue
+
+            decision = await self.ai_strategy.decide(
+                candidates=[ctx],
+                balance=equity,
+                recent_outcomes=self._recent_outcomes,
             )
-            trade_log.log(
-                "skip", s=decision.symbol,
-                why=f"ai_low_conf:{decision.confidence:.2f}",
-            )
+            if decision is None:
+                continue
+            if not decision.is_trade:
+                logger.debug(
+                    "AI skip on {}: {}", cand.symbol, decision.reasoning[:80],
+                )
+                continue
+            # The AI received a single candidate; coerce the symbol to
+            # the one we actually asked about.
+            if decision.symbol and decision.symbol != cand.symbol:
+                logger.debug(
+                    "AI returned {} for {}; ignoring",
+                    decision.symbol, cand.symbol,
+                )
+                continue
+            if decision.confidence < min_conf:
+                logger.debug(
+                    "AI conf {:.2f} on {} below {:.2f} — next",
+                    decision.confidence, cand.symbol, min_conf,
+                )
+                continue
+
+            veto, veto_reason = self._mtf_veto(ctx, decision)
+            if veto:
+                logger.info(
+                    "MTF veto {} {}: {}",
+                    decision.action, cand.symbol, veto_reason,
+                )
+                trade_log.log(
+                    "skip", s=cand.symbol,
+                    why=f"mtf_veto:{veto_reason[:80]}",
+                )
+                continue
+
+            veto, veto_reason = self._pullback_veto(ctx, decision)
+            if veto:
+                logger.info(
+                    "Pullback veto {} {}: {}",
+                    decision.action, cand.symbol, veto_reason,
+                )
+                trade_log.log(
+                    "skip", s=cand.symbol,
+                    why=f"pullback_veto:{veto_reason[:80]}",
+                )
+                continue
+
+            await self._open_from_decision(ctx, decision, equity)
             return
 
-        # Resolve the context for the chosen symbol.
-        chosen = next((c for c in ctxs if c.symbol == decision.symbol), None)
-        if chosen is None:
-            logger.warning(
-                "AI chose {} which is not in the shortlist; skipping",
-                decision.symbol,
-            )
-            trade_log.log(
-                "skip", s=decision.symbol, why="ai_symbol_off_list",
-            )
-            return
-
-        # MTF alignment guard: don't LONG a symbol whose HTF is clearly
-        # bearish (or vice versa) unless it's explicitly flagged as a
-        # high-conviction reversal setup. This is the last line of defense
-        # against "buying the pump / shorting the dump" failures.
-        veto, veto_reason = self._mtf_veto(chosen, decision)
-        if veto:
-            logger.warning(
-                "MTF guard vetoed {} {}: {}",
-                decision.action, decision.symbol, veto_reason,
-            )
-            trade_log.log(
-                "skip", s=decision.symbol, why=f"mtf_veto:{veto_reason[:80]}",
-            )
-            return
-
-        # Pullback gate: only enter at the bottom of a pullback (LONG) or
-        # the top of a pullback (SHORT). Chasing mid-move is the #1 reason
-        # winners round-trip into losers.
-        veto, veto_reason = self._pullback_veto(chosen, decision)
-        if veto:
-            logger.warning(
-                "Pullback guard vetoed {} {}: {}",
-                decision.action, decision.symbol, veto_reason,
-            )
-            trade_log.log(
-                "skip", s=decision.symbol,
-                why=f"pullback_veto:{veto_reason[:80]}",
-            )
-            return
-
-        await self._open_from_decision(chosen, decision, equity)
+        logger.info("Scan finished: no tradeable setup across {} candidates",
+                    len(candidates))
 
     def _mtf_veto(
         self, cand: _CandidateCtx, decision: AIDecision,
@@ -573,6 +577,7 @@ class DirectionalTrader:
             atr_pct=atr_pct,
             base_leverage=leverage, max_leverage=max_lev,
             max_margin_pct=self.cfg.directional.max_margin_pct,
+            hard_margin_pct=self.cfg.directional.hard_margin_pct,
             min_leverage=min_lev,
         )
         if not tp.feasible:

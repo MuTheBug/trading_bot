@@ -76,6 +76,7 @@ def compute_trade_plan(
     max_leverage: int,
     max_margin_pct: float = 90.0,
     min_leverage: int = 1,
+    hard_margin_pct: float = 98.0,
 ) -> TradePlan:
     """Compute qty + leverage so $-risk == equity * risk_pct / 100.
 
@@ -84,7 +85,10 @@ def compute_trade_plan(
     2. qty = risk$ / |entry - stop|, floored to LOT_SIZE.
     3. If notional < min_notional OR qty < min_qty, bump leverage (up to cap)
        so the smallest allowed qty still fits within max_margin_pct of equity.
-    4. If margin > max_margin_pct * equity, downsize qty to fit.
+    4. Expensive-asset fallback: if the exchange's min_notional forces a
+       margin above ``max_margin_pct`` even at max leverage, accept it up
+       to ``hard_margin_pct`` of equity (leaves a small buffer for fees
+       and slippage). Reject only if we'd blow through that hard cap.
     5. Re-check all filters; return infeasible if anything fails.
     """
     if equity <= 0 or entry_price <= 0 or stop_price <= 0:
@@ -118,21 +122,31 @@ def compute_trade_plan(
         bumped = True
 
     notional = qty * entry_price
-    margin_cap = equity * (max_margin_pct / 100.0)
+    soft_cap = equity * (max_margin_pct / 100.0)
+    hard_cap = equity * (max(hard_margin_pct, max_margin_pct) / 100.0)
 
-    # Raise leverage to fit margin cap if needed (small-capital case).
-    needed_lev = math.ceil(notional / max(margin_cap, 1e-9))
-    if needed_lev > leverage:
-        leverage = min(max_leverage, int(needed_lev))
+    # Raise leverage so margin fits under the soft cap when possible.
+    needed_lev_soft = math.ceil(notional / max(soft_cap, 1e-9))
+    if needed_lev_soft > leverage:
+        leverage = min(max_leverage, int(needed_lev_soft))
 
+    # Still too expensive at soft cap? Try harder — push leverage up so
+    # margin fits under the hard cap. This is the "expensive asset" path.
     margin = notional / max(leverage, 1)
-    if margin > margin_cap:
-        # Even at max leverage we can't afford one unit at the exchange
-        # minimum — trade is not feasible on this account.
+    elevated_margin = False
+    if margin > soft_cap:
+        needed_lev_hard = math.ceil(notional / max(hard_cap, 1e-9))
+        if needed_lev_hard > leverage:
+            leverage = min(max_leverage, int(needed_lev_hard))
+            margin = notional / max(leverage, 1)
+        if margin > soft_cap:
+            elevated_margin = True  # accepted, but over the soft cap
+
+    if margin > hard_cap:
         return TradePlan(
             qty, leverage, notional, margin, 0.0, False,
-            f"min lot margin {margin:.4f} > {max_margin_pct:.0f}% of equity "
-            f"({margin_cap:.4f}) even at {leverage}x",
+            f"min lot margin {margin:.4f} > {hard_margin_pct:.0f}% of equity "
+            f"({hard_cap:.4f}) even at {leverage}x",
         )
 
     # Verify notional meets exchange minimum.
@@ -144,12 +158,18 @@ def compute_trade_plan(
 
     # Effective $-risk at this qty.
     effective_risk = qty * stop_distance
-    reason = ""
+    notes: list[str] = []
     if bumped:
-        reason = (
+        notes.append(
             f"qty bumped to exchange minimum; risk {effective_risk:.4f} "
             f"> target {risk_dollars:.4f}"
         )
+    if elevated_margin:
+        notes.append(
+            f"expensive asset: margin {margin/equity*100:.1f}% of equity "
+            f"(> soft cap {max_margin_pct:.0f}%) at {leverage}x"
+        )
+    reason = "; ".join(notes)
     return TradePlan(qty, leverage, notional, margin, effective_risk, True, reason)
 
 
