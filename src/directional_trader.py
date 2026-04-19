@@ -207,21 +207,21 @@ class DirectionalTrader:
             return
         if result.action == "EXIT":
             entry = pos.entry_price
-            # Predict final PnL (realised on partials + about-to-close leg).
-            final_leg = (
-                (mark - entry) * pos.remaining_qty if pos.side == "LONG"
-                else (entry - mark) * pos.remaining_qty
-            )
-            projected_pnl = pos.realised_pnl + final_leg
             peak_pct = pos.peak_profit_pct
             symbol = pos.symbol
             side = pos.side
             qty = pos.original_qty
-            await self.pm.close(result.reason or "MANUAL", mark)
-            self._record_exit(symbol, side, mark, result.reason, projected_pnl)
+            # Close at market; pm.close updates pos.realised_pnl with the
+            # *actual* fill price and tracks fees across all partials.
+            close_order = await self.pm.close(result.reason or "MANUAL", mark)
+            exit_price = close_order.avg_price or mark
+            gross_pnl = pos.realised_pnl
+            fees = pos.fees_paid
+            net_pnl = gross_pnl - fees
+            self._record_exit(symbol, side, exit_price, result.reason, net_pnl)
             await self._notify_close(
-                symbol, side, qty, entry, mark, result.reason,
-                projected_pnl, peak_pct,
+                symbol, side, qty, entry, exit_price, result.reason,
+                net_pnl, peak_pct, gross_pnl=gross_pnl, fees=fees,
             )
 
     def _record_exit(
@@ -460,6 +460,7 @@ class DirectionalTrader:
     async def _notify_close(
         self, symbol: str, side: str, qty: float, entry: float, exit_price: float,
         reason: Any, pnl: float, peak_pct: float,
+        gross_pnl: Optional[float] = None, fees: Optional[float] = None,
     ) -> None:
         if self.notifier is None:
             return
@@ -468,11 +469,14 @@ class DirectionalTrader:
             else (entry - exit_price) / entry * 100.0
         ) if entry > 0 else 0.0
         emoji = "\U0001f7e2" if pnl > 0 else ("\U0001f534" if pnl < 0 else "\u26aa")
+        breakdown = ""
+        if gross_pnl is not None and fees is not None:
+            breakdown = f"\n(gross {gross_pnl:+.4f} − fees {fees:.4f})"
         text = (
             f"{emoji} <b>CLOSE {side}</b> {symbol} ({reason})\n"
             f"Entry: <code>{entry:.6f}</code>  Exit: <code>{exit_price:.6f}</code>\n"
             f"Move: {move_pct:+.2f}%  Peak: {peak_pct:+.2f}%\n"
-            f"PnL: <b>{pnl:+.4f} USDT</b>"
+            f"Net PnL: <b>{pnl:+.4f} USDT</b>{breakdown}"
         )
         try:
             await self.notifier.send(text)
