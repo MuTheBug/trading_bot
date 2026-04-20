@@ -190,26 +190,39 @@ class SRConfig(BaseModel):
 
     Used when ``trading_mode: directional`` (default). The directional
     trader no longer calls an LLM — it runs this rule-based S/R engine
-    per candidate.
+    per candidate across three timeframes:
+
+      * ``level_timeframe``   — where swing pivots cluster into real
+        structural levels (default 1h: meaningful swings, not 15m noise).
+      * ``bias_timeframe``    — HTF EMA trend gate. 4h gives responsive
+        bias without the lag of a 1d EMA for intraday-to-swing entries.
+      * ``trigger_timeframe`` — rejection candle + entry price come from
+        here so we react quickly once HTF structure aligns.
     """
 
-    # Pivot detection — fractal-style swing on closed bars.
-    pivot_left: int = 3                    # bars to the left for swing confirmation
-    pivot_right: int = 3                   # bars to the right
+    # Timeframe layout.
+    level_timeframe: str = "1h"
+    bias_timeframe: str = "4h"
+    trigger_timeframe: str = "15m"
+
+    # Pivot detection — fractal-style swing on closed bars of the level TF.
+    # Wider windows on 1h reduce noise and keep only meaningful swings.
+    pivot_left: int = 4
+    pivot_right: int = 4
     max_lookback_bars: int = 200           # keep levels found within last N closed bars
 
     # Clustering — pivots within tolerance*ATR collapse to one level.
-    level_tolerance_atr: float = 0.3
+    level_tolerance_atr: float = 0.4
     min_touches: int = 2                   # discard one-off pivots
-    min_level_strength: float = 1.8        # composite strength threshold
+    min_level_strength: float = 2.0        # composite strength threshold
 
     # Setup rules.
-    htf_trend_ema: int = 50                # EMA period for HTF bias classifier
-    entry_zone_atr: float = 0.5            # must be within N ATR of the level
-    sl_buffer_atr: float = 0.6             # SL = level -/+ buffer*ATR
+    htf_trend_ema: int = 50                # EMA period on the bias TF
+    entry_zone_atr: float = 0.5            # trigger-price must be within N * level_ATR of the level
+    sl_buffer_atr: float = 0.6             # SL = level -/+ buffer * level_ATR
     min_rr: float = 1.5                    # final TP must give at least this R:R
     max_tp_levels: int = 3                 # max TP ladder steps
-    require_rejection_candle: bool = True  # demand a confirmation candle
+    require_rejection_candle: bool = True  # demand a confirmation candle on trigger TF
     max_rsi_for_long: float = 68.0
     min_rsi_for_short: float = 32.0
 

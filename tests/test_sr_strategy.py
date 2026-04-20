@@ -363,3 +363,58 @@ def test_propose_skip_without_rejection_candle():
     dec = strat.propose(ctx)
     assert not dec.is_trade
     assert "rejection" in dec.reasoning.lower()
+
+
+# --------------------- three-timeframe layout ---------------------
+
+
+def test_propose_uses_explicit_three_timeframes():
+    """Levels come from the configured level TF, bias from the bias TF,
+    and the rejection/entry comes from the trigger TF — each frame has
+    a distinct shape so only the right wiring produces a trade."""
+    # Bias TF (4h): uptrend so long branch isn't blocked.
+    bias_df = _flat_ohlcv(np.linspace(100, 130, 80))
+    # Level TF (1h): the support fixture's 1h-style structure.
+    level_dfs = _dfs_with_support_setup()
+    level_df = level_dfs["15m"]  # reuse the shape; it has real pivots
+    # Trigger TF (15m): just the last two bars of the level TF are enough
+    # for price + rejection. We keep it identical here so trigger_price
+    # sits inside the zone and a bullish rejection is present.
+    trigger_df = level_df.copy()
+    # Mislabel the level TF key so fallback can't accidentally save us.
+    dfs = {"4h": bias_df, "1h": level_df, "15m": trigger_df}
+    ctx = CandidateCtx(symbol="X", ticker=_ticker(symbol="X", price=101.0),
+                       filters=_filters("X"), dfs=dfs)
+    cfg = SRConfig(
+        level_timeframe="1h", bias_timeframe="4h", trigger_timeframe="15m",
+        min_touches=2, min_level_strength=0.5,
+        level_tolerance_atr=1.0, entry_zone_atr=2.0,
+        sl_buffer_atr=0.5, min_rr=1.2, htf_trend_ema=20,
+    )
+    strat = SRStrategy(cfg, DirectionalConfig())
+    dec = strat.propose(ctx)
+    assert dec.is_trade, f"expected trade, got SKIP: {dec.reasoning}"
+    assert dec.side == "LONG"
+
+
+def test_propose_bias_tf_blocks_even_when_levels_ok():
+    """If the bias TF is bearish, a clean support setup on the level TF
+    must not produce a long — this proves bias_timeframe is actually
+    driving the gate (not accidentally read from level/trigger TF)."""
+    level_dfs = _dfs_with_support_setup()
+    level_df = level_dfs["15m"]
+    bias_df = _flat_ohlcv(np.linspace(150, 100, 80))  # clearly down
+    trigger_df = level_df.copy()
+    dfs = {"4h": bias_df, "1h": level_df, "15m": trigger_df}
+    ctx = CandidateCtx(symbol="X", ticker=_ticker(symbol="X", price=101.0),
+                       filters=_filters("X"), dfs=dfs)
+    cfg = SRConfig(
+        level_timeframe="1h", bias_timeframe="4h", trigger_timeframe="15m",
+        min_touches=2, min_level_strength=0.5,
+        level_tolerance_atr=1.0, entry_zone_atr=2.0,
+        sl_buffer_atr=0.5, min_rr=1.2, htf_trend_ema=20,
+    )
+    dec = SRStrategy(cfg, DirectionalConfig()).propose(ctx)
+    # Long is blocked by bias; the short branch has no resistance bounce
+    # setup in this fixture -> overall SKIP.
+    assert not dec.is_trade

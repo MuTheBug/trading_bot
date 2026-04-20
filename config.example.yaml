@@ -93,21 +93,33 @@ directional:
 
 # --- Support / Resistance strategy parameters ---
 # Used by the directional trader. All rule-based — no LLM calls.
+#
+# Three timeframes with distinct jobs:
+#   - level_timeframe:   where structural S/R is detected (1h gives much
+#                        cleaner pivots than 15m intraday noise).
+#   - bias_timeframe:    EMA trend gate (4h is responsive enough for
+#                        swing/intraday without lagging like 1d).
+#   - trigger_timeframe: where the rejection candle + entry price come
+#                        from so reactions are prompt once HTF aligns.
+# All three MUST appear in directional.mtf_timeframes above.
 sr:
-  pivot_left: 3                 # bars to the left for swing confirmation
-  pivot_right: 3                # bars to the right
+  level_timeframe: "1h"
+  bias_timeframe: "4h"
+  trigger_timeframe: "15m"
+  pivot_left: 4                 # bars left for swing confirmation on level TF
+  pivot_right: 4                # bars right
   max_lookback_bars: 200        # keep pivots within last N closed bars
-  level_tolerance_atr: 0.3      # cluster pivots within this * ATR into one level
+  level_tolerance_atr: 0.4      # cluster pivots within this * ATR into one level
   min_touches: 2                # discard one-off pivots
-  min_level_strength: 1.8       # composite score threshold (touches + recency + held)
-  htf_trend_ema: 50             # EMA period for HTF bias classifier
-  entry_zone_atr: 0.5           # price must sit within N * ATR of the level
-  sl_buffer_atr: 0.6            # SL = level -/+ buffer * ATR
+  min_level_strength: 2.0       # composite score threshold (touches + recency + held)
+  htf_trend_ema: 50             # EMA period on the bias TF
+  entry_zone_atr: 0.5           # trigger price must be within N * level_ATR of the level
+  sl_buffer_atr: 0.6            # SL = level -/+ buffer * level_ATR
   min_rr: 1.5                   # final TP must give at least this reward:risk
   max_tp_levels: 3              # cap TP ladder steps
-  require_rejection_candle: true # demand a bullish/bearish rejection bar at the level
-  max_rsi_for_long: 68.0        # skip long bounces when LTF RSI already too hot
-  min_rsi_for_short: 32.0       # skip short fades when LTF RSI already too cold
+  require_rejection_candle: true # demand a bullish/bearish rejection bar on trigger TF
+  max_rsi_for_long: 68.0        # skip long bounces when trigger RSI already too hot
+  min_rsi_for_short: 32.0       # skip short fades when trigger RSI already too cold
 
 # --- Simulator (paper trading) ---
 simulator:

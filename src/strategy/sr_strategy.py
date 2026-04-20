@@ -322,28 +322,39 @@ class SRStrategy:
     def propose(self, ctx: CandidateCtx) -> SRDecision:
         if not ctx.dfs:
             return SRDecision(action="SKIP", reasoning="no MTF data")
-        tfs = list(ctx.dfs.keys())
-        ltf_name = tfs[-1]
-        htf_name = tfs[0]
-        ltf = ctx.dfs[ltf_name]
-        htf = ctx.dfs[htf_name]
 
-        levels = detect_levels(ltf, self.sr)
+        # Resolve the three timeframes explicitly so tests and the trader
+        # share the same layout. If a requested TF is missing, fall back
+        # to the highest / lowest available so we stay functional on
+        # partial MTF data.
+        tfs = list(ctx.dfs.keys())
+        level_df = ctx.dfs.get(self.sr.level_timeframe, ctx.dfs[tfs[-1]])
+        bias_df = ctx.dfs.get(self.sr.bias_timeframe, ctx.dfs[tfs[0]])
+        trigger_df = ctx.dfs.get(self.sr.trigger_timeframe, ctx.dfs[tfs[-1]])
+
+        levels = detect_levels(level_df, self.sr)
         if levels is None:
             return SRDecision(
                 action="SKIP",
-                reasoning=f"insufficient data on {ltf_name} for level detection",
+                reasoning=f"insufficient data on {self.sr.level_timeframe} "
+                          f"for level detection",
             )
-        bias = classify_bias(htf, self.sr.htf_trend_ema)
+        bias = classify_bias(bias_df, self.sr.htf_trend_ema)
 
-        closed = ltf.iloc[:-1] if len(ltf) > 1 else ltf
-        last_bar = closed.iloc[-1]
+        # Entry price + rejection candle come from the trigger TF — that
+        # is the bar the trader will actually react to. Level ATR keeps
+        # zone width / SL buffer sized in the structure's own volatility.
+        trig_closed = trigger_df.iloc[:-1] if len(trigger_df) > 1 else trigger_df
+        if len(trig_closed) == 0:
+            return SRDecision(action="SKIP",
+                             reasoning="empty trigger timeframe")
+        last_bar = trig_closed.iloc[-1]
         price = float(last_bar["close"])
         atr_val = levels.atr
         if atr_val <= 0 or price <= 0:
             return SRDecision(action="SKIP", reasoning="non-positive atr or price")
 
-        rsi_s = rsi_ind(closed["close"], 14)
+        rsi_s = rsi_ind(trig_closed["close"], 14)
         last_rsi = float(rsi_s.iloc[-1]) if not rsi_s.isna().iloc[-1] else 50.0
 
         # Try LONG first (support bounce).
