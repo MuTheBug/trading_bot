@@ -1,20 +1,21 @@
-"""AI-driven directional trading loop (long / short / skip).
+"""Directional trading loop (long / short / skip) driven by the
+deterministic support/resistance strategy.
 
 Each scan:
 
-1. Prescreen tickers by liquidity + activity (math, no AI) to cut the
-   universe to a manageable shortlist.
-2. Fetch 15m + 1h klines for each shortlisted symbol.
-3. Build a rich payload (OHLCV tails, indicators, regime classification,
-   account balance, risk caps, recent trade outcomes) and send the WHOLE
-   shortlist to the AI.
-4. The AI returns ONE decision: OPEN_LONG, OPEN_SHORT (with symbol +
-   entry/SL/TPs/leverage) or SKIP.
-5. If a trade, validate + size with the adaptive leverage planner and
-   hand off to the PositionManager.
+1. Prescreen all USDT-M tickers by liquidity + activity. With
+   ``scan_top_n <= 0`` no cap is applied, so every liquid symbol is
+   considered.
+2. For each candidate (one by one, highest activity first) fetch MTF
+   klines and build a `CandidateCtx`.
+3. The `SRStrategy` inspects the frames, detects clustered pivots into
+   support/resistance levels, classifies HTF bias, and proposes an
+   entry at a pullback to a strong level with a rejection candle.
+4. Remaining vetoes (HTF alignment, pullback-location sanity) then
+   fire; accepted setups go through the adaptive leverage planner and
+   on to the PositionManager.
 
-The deterministic regime classifier is still run but only to enrich the
-AI's context — it does not constrain direction or setup choice.
+No LLM call is made — the signal is fully reproducible.
 """
 from __future__ import annotations
 
@@ -33,11 +34,15 @@ from .position.manager import PositionManager
 from .risk.leverage import TradePlan, adaptive_leverage, compute_trade_plan
 from .risk.risk_manager import RiskManager
 from .state import StateStore
-from .strategy.ai_directional import (
-    AIDecision,
-    AIDirectionalStrategy,
-    _CandidateCtx,
+from .strategy.sr_strategy import (
+    CandidateCtx,
+    SRDecision,
+    SRStrategy,
 )
+
+# Public re-exports — tests and older callers expect these names here.
+AIDecision = SRDecision  # backwards-compat alias
+_CandidateCtx = CandidateCtx
 
 
 @dataclass
@@ -98,7 +103,7 @@ def _prescreen(
 
 
 class DirectionalTrader:
-    """AI-driven long/short trader. One position at a time."""
+    """Deterministic S/R long/short trader. One position at a time."""
 
     def __init__(
         self,
@@ -113,11 +118,9 @@ class DirectionalTrader:
         self.cfg = config
         self.notifier = notifier
         self.risk = RiskManager(config.risk, config.grid)
-        self.ai_strategy = AIDirectionalStrategy(
-            ai_cfg=config.ai,
+        self.strategy = SRStrategy(
+            sr_cfg=config.sr,
             dir_cfg=config.directional,
-            api_key=secrets.ai_api_key,
-            base_url=secrets.ai_base_url,
         )
         d = config.directional
         self.pm = PositionManager(
@@ -316,41 +319,27 @@ class DirectionalTrader:
             candidates = candidates[:max_calls]
 
         logger.info(
-            "AI directional scan: iterating {} candidates one-by-one, balance={:.4f}",
+            "S/R scan: iterating {} candidates one-by-one, balance={:.4f}",
             len(candidates), equity,
         )
 
-        # Walk candidates in score order. Per-symbol AI call; first one
-        # that produces a high-confidence, veto-clean trade wins.
+        # Walk candidates in score order. First one to produce a
+        # qualifying S/R setup that also clears the vetoes wins.
         min_conf = self.cfg.directional.min_confidence
         for cand in candidates:
             ctx = await self._build_mtf_ctx(cand)
             if ctx is None:
                 continue
 
-            decision = await self.ai_strategy.decide(
-                candidates=[ctx],
-                balance=equity,
-                recent_outcomes=self._recent_outcomes,
-            )
-            if decision is None:
-                continue
+            decision = self.strategy.propose(ctx)
             if not decision.is_trade:
                 logger.debug(
-                    "AI skip on {}: {}", cand.symbol, decision.reasoning[:80],
-                )
-                continue
-            # The AI received a single candidate; coerce the symbol to
-            # the one we actually asked about.
-            if decision.symbol and decision.symbol != cand.symbol:
-                logger.debug(
-                    "AI returned {} for {}; ignoring",
-                    decision.symbol, cand.symbol,
+                    "S/R skip on {}: {}", cand.symbol, decision.reasoning[:120],
                 )
                 continue
             if decision.confidence < min_conf:
                 logger.debug(
-                    "AI conf {:.2f} on {} below {:.2f} — next",
+                    "S/R conf {:.2f} on {} below {:.2f} — next",
                     decision.confidence, cand.symbol, min_conf,
                 )
                 continue

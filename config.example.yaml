@@ -54,10 +54,12 @@ grid:
   min_volume_usd: 50000000       # minimum 24h volume to even consider a symbol
   heartbeat_ticks: 30            # write a compact snapshot to trades.log every N ticks (0 = off)
 
-# --- Directional (AI long/short) ---
+# --- Directional (deterministic S/R long/short) ---
 # Only used when trading_mode: directional.
-# The AI decides side, entry, SL, TPs, and (optionally) leverage for each
-# trade. These settings are the HARD CAPS and defaults the AI operates
+# The bot uses a deterministic support/resistance strategy (no LLM on
+# the hot path): it finds swing pivots, clusters them into levels, and
+# only enters when price taps a strong level with a rejection candle.
+# These settings are the HARD CAPS and defaults the engine operates
 # within — risk_per_trade_pct and max_leverage are not negotiable.
 directional:
   risk_per_trade_pct: 1.0       # % of equity risked per trade (at SL)
@@ -70,12 +72,10 @@ directional:
   scan_top_n: 0                 # 0 = scan every liquid symbol one-by-one; >0 caps to the top-N most active
   scan_max_ai_calls: 120        # safety cap on AI calls per scan pass (stops early once a trade is found)
   scan_interval_seconds: 60     # min gap between scans when flat
-  min_confidence: 0.45          # reject the AI's setup if its confidence < this
-  # Multi-timeframe analysis. The AI receives each candidate's data for
-  # every timeframe listed here, ordered TOP-DOWN (highest first, lowest
-  # last). The model is instructed to: (1) read the HTF trend, (2) confirm
-  # on MTF, (3) use LTF only for entry timing. Supported: 1d, 4h, 1h, 15m,
-  # 5m, 3m, 1m. More TFs = more context but more tokens and slower scans.
+  min_confidence: 0.45          # reject the setup if strategy confidence < this
+  # Multi-timeframe analysis. Levels are detected on the lowest TF in
+  # this list; bias comes from the highest. Order TOP-DOWN (highest
+  # first, lowest last). Supported: 1d, 4h, 1h, 15m, 5m, 3m, 1m.
   mtf_timeframes: ["1d", "4h", "1h", "15m"]
   adx_strong: 25.0              # ADX >= this => strong trend regime
   adx_weak: 18.0                # ADX in [weak, strong) => weak trend
@@ -90,6 +90,24 @@ directional:
   giveback_exit_pct: 0.6        # exit if we give back this much % from peak
   time_stop_hours: 24.0         # close if position still open after N hours
   max_loss_pct: 6.0             # hard cap % loss on open-equity
+
+# --- Support / Resistance strategy parameters ---
+# Used by the directional trader. All rule-based — no LLM calls.
+sr:
+  pivot_left: 3                 # bars to the left for swing confirmation
+  pivot_right: 3                # bars to the right
+  max_lookback_bars: 200        # keep pivots within last N closed bars
+  level_tolerance_atr: 0.3      # cluster pivots within this * ATR into one level
+  min_touches: 2                # discard one-off pivots
+  min_level_strength: 1.8       # composite score threshold (touches + recency + held)
+  htf_trend_ema: 50             # EMA period for HTF bias classifier
+  entry_zone_atr: 0.5           # price must sit within N * ATR of the level
+  sl_buffer_atr: 0.6            # SL = level -/+ buffer * ATR
+  min_rr: 1.5                   # final TP must give at least this reward:risk
+  max_tp_levels: 3              # cap TP ladder steps
+  require_rejection_candle: true # demand a bullish/bearish rejection bar at the level
+  max_rsi_for_long: 68.0        # skip long bounces when LTF RSI already too hot
+  min_rsi_for_short: 32.0       # skip short fades when LTF RSI already too cold
 
 # --- Simulator (paper trading) ---
 simulator:

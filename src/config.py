@@ -156,12 +156,12 @@ class DirectionalConfig(BaseModel):
 
     # Scanning
     min_volume_usd: float = 50_000_000
-    scan_top_n: int = 0                    # 0 = scan every liquid symbol (one-by-one AI call)
-    scan_max_ai_calls: int = 120           # safety cap on AI calls per scan pass
+    scan_top_n: int = 0                    # 0 = scan every liquid symbol (one-by-one)
+    scan_max_ai_calls: int = 120           # safety cap on setup proposals per scan pass
     scan_interval_seconds: int = 60        # min gap between scans when flat
-    min_confidence: float = 0.45           # reject if the AI's self-confidence is below this
-    # Multi-timeframe analysis: top-down ordered list of timeframes the
-    # AI receives per candidate. Must be ordered HIGHEST -> LOWEST.
+    min_confidence: float = 0.45           # reject if the strategy's self-confidence is below this
+    # Multi-timeframe analysis: top-down ordered list of timeframes used
+    # for level detection. Must be ordered HIGHEST -> LOWEST.
     # Supported: 1d, 4h, 1h, 15m, 5m, 3m, 1m.
     mtf_timeframes: List[str] = Field(
         default_factory=lambda: ["1d", "4h", "1h", "15m"]
@@ -185,6 +185,35 @@ class DirectionalConfig(BaseModel):
     max_loss_pct: float = 6.0              # hard cap % of open-equity
 
 
+class SRConfig(BaseModel):
+    """Deterministic support/resistance strategy parameters.
+
+    Used when ``trading_mode: directional`` (default). The directional
+    trader no longer calls an LLM — it runs this rule-based S/R engine
+    per candidate.
+    """
+
+    # Pivot detection — fractal-style swing on closed bars.
+    pivot_left: int = 3                    # bars to the left for swing confirmation
+    pivot_right: int = 3                   # bars to the right
+    max_lookback_bars: int = 200           # keep levels found within last N closed bars
+
+    # Clustering — pivots within tolerance*ATR collapse to one level.
+    level_tolerance_atr: float = 0.3
+    min_touches: int = 2                   # discard one-off pivots
+    min_level_strength: float = 1.8        # composite strength threshold
+
+    # Setup rules.
+    htf_trend_ema: int = 50                # EMA period for HTF bias classifier
+    entry_zone_atr: float = 0.5            # must be within N ATR of the level
+    sl_buffer_atr: float = 0.6             # SL = level -/+ buffer*ATR
+    min_rr: float = 1.5                    # final TP must give at least this R:R
+    max_tp_levels: int = 3                 # max TP ladder steps
+    require_rejection_candle: bool = True  # demand a confirmation candle
+    max_rsi_for_long: float = 68.0
+    min_rsi_for_short: float = 32.0
+
+
 TradingMode = Literal["grid", "directional"]
 
 
@@ -201,6 +230,7 @@ class BotConfig(BaseModel):
     ai: AIConfig = Field(default_factory=AIConfig)
     grid: GridConfig = Field(default_factory=GridConfig)
     directional: DirectionalConfig = Field(default_factory=DirectionalConfig)
+    sr: SRConfig = Field(default_factory=SRConfig)
     loop_interval_seconds: int = 10
     kline_history: int = 200
     log_level: str = "INFO"

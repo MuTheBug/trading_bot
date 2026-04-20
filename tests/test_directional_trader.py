@@ -4,7 +4,7 @@ import pandas as pd
 
 from src.directional_trader import DirectionalTrader, _prescreen
 from src.exchange.base import SymbolFilters, TickerInfo
-from src.strategy.ai_directional import AIDecision, _CandidateCtx
+from src.strategy.sr_strategy import SRDecision as AIDecision, CandidateCtx as _CandidateCtx
 
 
 def _ohlcv(closes):

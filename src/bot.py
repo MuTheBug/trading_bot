@@ -46,7 +46,11 @@ class TradingBot:
         self.state = StateStore(config.state_file)
         self.exchange: ExchangeInterface = self._build_exchange()
         self.grid_manager = GridManager(self.exchange, self.state)
-        self.ai_strategy = self._build_ai_strategy()
+        # The AI grid strategy is only used in grid mode. Directional
+        # mode runs on the deterministic S/R engine with no API key.
+        self.ai_strategy = (
+            self._build_ai_strategy() if config.trading_mode == "grid" else None
+        )
         # Directional trader is built lazily for grid-mode users so they
         # don't pay the import cost of the regime stack.
         self.telegram = TelegramNotifier(
