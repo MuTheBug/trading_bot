@@ -1,74 +1,141 @@
-# Binance USDT-M Futures Trading Bot - strategy & risk configuration
+# Binance USDT-M Futures Grid Trading Bot
 # The installer copies this to config.yaml on first run.
-
-# --- Symbols to trade (low-notional alts for a $10 account) ---
-symbols:
-  - DOGEUSDT
-  - 1000PEPEUSDT
-  - XRPUSDT
-  - SUIUSDT
-  - 1000SHIBUSDT
+# AI scans all USDT-M perpetual symbols and picks the best one automatically.
 
 # --- Timeframes ---
-timeframe: 15m            # signal timeframe
-htf_timeframe: 1h         # higher-timeframe trend filter
+timeframe: 15m            # candle timeframe for AI context
+htf_timeframe: 1h         # higher-timeframe (unused by grid but kept for future)
 
-# --- Leverage & margin ---
-leverage: 3               # 3x isolated (balanced profile)
+# --- Margin ---
 margin_type: ISOLATED     # ISOLATED | CROSSED
+
+# --- Trading mode ---
+# directional (default): AI-driven long/short. Each scan, the bot sends
+#   full market context (OHLCV, indicators, regime, balance, recent
+#   trades) for a shortlist of candidates to the AI and executes the
+#   single decision it returns (OPEN_LONG/OPEN_SHORT/SKIP) with
+#   adaptive leverage + tiered TP + trailing stop + breakeven.
+# grid: legacy neutral grid trading (AI picks a ranging symbol and
+#   places orders on both sides).
+trading_mode: directional  # directional | grid
 
 # --- Risk management ---
 risk:
-  risk_per_trade_pct: 1.0         # % of equity risked per trade
-  max_concurrent_positions: 2     # max simultaneous open positions
-  daily_loss_limit_pct: 2.0       # halt entries for the day if daily PnL <= -X%
-  max_drawdown_pct: 10.0          # halt entries until manual resume if DD >= X%
-  funding_rate_skip_pct: 15.0     # skip entry if |annualized funding| > X%
-  funding_rate_exit_pct: 20.0     # force-close on same side if |annualized funding| > X%
-  time_stop_hours: 24             # force-close if no TP hit after X hours
-  cooldown_after_loss_minutes: 15 # no entries on same symbol for X min after a loss
+  risk_per_trade_pct: 1.0         # (legacy, kept for compatibility)
+  max_concurrent_positions: 1     # grid uses 1 position (the grid itself)
+  daily_loss_limit_pct: 3.0       # halt grid for the day if daily PnL <= -X%
+  max_drawdown_pct: 15.0          # halt grid until manual resume if DD >= X%
+  funding_rate_skip_pct: 15.0     # (unused by grid)
+  funding_rate_exit_pct: 25.0     # force-teardown grid if net exposure + funding is bad
+  time_stop_hours: 24             # (legacy, kept for compatibility)
+  cooldown_after_loss_minutes: 15 # (legacy, kept for compatibility)
 
-# --- Strategy parameters (trend-momentum hybrid) ---
-strategy:
-  name: trend_momentum
-  ema_fast: 9
-  ema_slow: 21
-  ema_htf: 50
-  adx_period: 14
-  adx_threshold: 20
-  rsi_period: 14
-  rsi_long_min: 40
-  rsi_long_max: 70
-  rsi_short_min: 30
-  rsi_short_max: 60
-  atr_period: 14
-  volume_sma_period: 20
+# --- Grid settings ---
+# The AI sets the actual grid parameters (symbol, bounds, levels, leverage)
+# at runtime. These are constraints and defaults.
+grid:
+  max_grids: 15                  # max grid levels AI may create
+  min_grids: 3                   # minimum grid levels
+  rebalance_check_minutes: 15    # how often to ask AI to re-evaluate (lower = react faster to trends)
+  out_of_range_pct: 1.5          # % outside grid to trigger re-eval
+  max_unrealized_loss_pct: 5.0   # hard cap: close position if uPnL loss exceeds this % of equity
+  max_capital_pct: 50.0          # max % of balance the grid may commit (lower = headroom for drawdown)
+  max_leverage: 5                # hard cap on grid leverage (best real winner was 5x)
+  # --- Continuous per-tick safety ---
+  position_stop_loss_pct: 4.0    # close grid if price moves this % adverse from avg_entry
+  drift_exit_pct: 3.0            # exit if price drifts this % from grid center (trend detected)
+  take_profit_pct: 2.5           # fixed TP: lock in when ACTUAL equity delta >= this % of start equity
+  trailing_tp_arm_pct: 1.5       # arm trailing TP once gain >= this % of start equity
+  trailing_tp_giveback_pct: 0.5  # from peak gain, exit if we give back this much of start equity
+  take_profit_streak: 2          # require this many consecutive ticks over TP before firing
+  min_hold_minutes: 5            # don't TP/stop/drift-exit before the grid has had time to work
+  symbol_cooldown_minutes: 120   # after EXIT / stop / TP, skip that symbol for N min
+  post_exit_cooldown_minutes: 3  # after any close, pause ALL scans for N min (no instant re-entry)
+  min_volume_usd: 50000000       # minimum 24h volume to even consider a symbol
+  heartbeat_ticks: 30            # write a compact snapshot to trades.log every N ticks (0 = off)
 
-# --- Exit ladder (multiples of ATR) ---
-exits:
-  sl_atr_mult: 1.5            # initial stop loss distance
-  tp1_atr_mult: 0.75          # first take-profit
-  tp1_close_pct: 40           # % of position closed at TP1
-  tp2_atr_mult: 2.0           # second take-profit
-  tp2_close_pct: 30           # % of position closed at TP2
-  tp3_atr_mult: 4.0           # final take-profit
-  trail_atr_mult: 1.5         # trailing stop distance after TP2
-  move_sl_to_be_after_tp1: true
+# --- Directional (deterministic S/R long/short) ---
+# Only used when trading_mode: directional.
+# The bot uses a deterministic support/resistance strategy (no LLM on
+# the hot path): it finds swing pivots, clusters them into levels, and
+# only enters when price taps a strong level with a rejection candle.
+# These settings are the HARD CAPS and defaults the engine operates
+# within — risk_per_trade_pct and max_leverage are not negotiable.
+directional:
+  risk_per_trade_pct: 1.0       # % of equity risked per trade (at SL)
+  base_leverage: 3              # preferred leverage in neutral conditions
+  min_leverage: 1
+  max_leverage: 20              # hard cap
+  max_margin_pct: 85.0          # soft cap — normal trades keep margin under this % of equity
+  hard_margin_pct: 98.0         # hard cap — expensive assets (high min_notional) may use up to this % (leaves ~2% for fees)
+  min_volume_usd: 50000000      # minimum 24h volume to consider a symbol
+  scan_top_n: 0                 # 0 = scan every liquid symbol one-by-one; >0 caps to the top-N most active
+  scan_max_ai_calls: 120        # safety cap on AI calls per scan pass (stops early once a trade is found)
+  scan_interval_seconds: 60     # min gap between scans when flat
+  min_confidence: 0.45          # reject the setup if strategy confidence < this
+  # Multi-timeframe analysis. Levels are detected on the lowest TF in
+  # this list; bias comes from the highest. Order TOP-DOWN (highest
+  # first, lowest last). Supported: 1d, 4h, 1h, 15m, 5m, 3m, 1m.
+  mtf_timeframes: ["1d", "4h", "1h", "15m"]
+  adx_strong: 25.0              # ADX >= this => strong trend regime
+  adx_weak: 18.0                # ADX in [weak, strong) => weak trend
+  trail_atr_mult: 1.5           # trailing stop distance = mult * ATR
+  trail_arm_atr: 1.0            # arm trailing after +N ATR of profit
+  trail_tighten_atr: 2.0        # once profit >= N ATR, use tighter trail
+  trail_tighten_mult: 0.75      # trailing mult after tightening (lock in more)
+  breakeven_profit_pct: 0.4     # move SL to entry once uPnL% reaches this (protects winners)
+  breakeven_buffer_atr: 0.1     # breakeven stop = entry +/- buffer * ATR
+  breakeven_after_tp1: true     # also move SL to breakeven after first TP hit
+  giveback_arm_pct: 1.0         # arm giveback exit once peak uPnL% reaches this
+  giveback_exit_pct: 0.6        # exit if we give back this much % from peak
+  time_stop_hours: 24.0         # close if position still open after N hours
+  max_loss_pct: 6.0             # hard cap % loss on open-equity
+
+# --- Support / Resistance strategy parameters ---
+# Used by the directional trader. All rule-based — no LLM calls.
+#
+# Three timeframes with distinct jobs:
+#   - level_timeframe:   where structural S/R is detected (1h gives much
+#                        cleaner pivots than 15m intraday noise).
+#   - bias_timeframe:    EMA trend gate (4h is responsive enough for
+#                        swing/intraday without lagging like 1d).
+#   - trigger_timeframe: where the rejection candle + entry price come
+#                        from so reactions are prompt once HTF aligns.
+# All three MUST appear in directional.mtf_timeframes above.
+sr:
+  level_timeframe: "1h"
+  bias_timeframe: "4h"
+  trigger_timeframe: "15m"
+  pivot_left: 4                 # bars left for swing confirmation on level TF
+  pivot_right: 4                # bars right
+  max_lookback_bars: 200        # keep pivots within last N closed bars
+  level_tolerance_atr: 0.4      # cluster pivots within this * ATR into one level
+  min_touches: 2                # discard one-off pivots
+  min_level_strength: 2.0       # composite score threshold (touches + recency + held)
+  htf_trend_ema: 50             # EMA period on the bias TF
+  entry_zone_atr: 0.5           # trigger price must be within N * level_ATR of the level
+  sl_buffer_atr: 0.6            # SL = level -/+ buffer * level_ATR
+  min_rr: 1.5                   # final TP must give at least this reward:risk
+  max_tp_levels: 3              # cap TP ladder steps
+  require_rejection_candle: true # demand a bullish/bearish rejection bar on trigger TF
+  max_rsi_for_long: 68.0        # skip long bounces when trigger RSI already too hot
+  min_rsi_for_short: 32.0       # skip short fades when trigger RSI already too cold
 
 # --- Simulator (paper trading) ---
 simulator:
-  starting_balance: 10.0       # USDT
-  taker_fee_pct: 0.04          # Binance Futures taker fee
-  maker_fee_pct: 0.02
-  slippage_ticks: 1            # assume 1 tick slippage on market orders
+  starting_balance: 10.0          # USDT
+  taker_fee_pct: 0.04             # Binance Futures taker fee
+  maker_fee_pct: 0.02             # Binance Futures maker fee (grid uses limit orders)
+  slippage_ticks: 1               # assume 1 tick slippage on market orders
 
 # --- Bot loop ---
-loop_interval_seconds: 15      # how often to check for signals / manage positions
-kline_history: 200             # candles fetched per symbol
+loop_interval_seconds: 10         # how often to check fills / manage grid
+kline_history: 200                # candles fetched per request (for AI context)
 
 # --- Logging ---
-log_level: INFO                # DEBUG | INFO | WARNING | ERROR
+log_level: INFO                   # DEBUG | INFO | WARNING | ERROR
 log_file: logs/bot.log
+trade_log_file: logs/trades.log   # compact event log for AI strategy review
 state_file: state/bot_state.json
 
 # --- Telegram ---
@@ -77,4 +144,17 @@ telegram:
   alerts_on_entry: true
   alerts_on_exit: true
   alerts_on_error: true
-  daily_summary_utc_hour: 0    # post daily summary at this UTC hour
+  daily_summary_utc_hour: 0       # post daily summary at this UTC hour
+
+# --- AI brain (MiniMax M2.7 via Anthropic-compatible API) ---
+# The AI scans symbols, picks the best one, and decides grid parameters.
+ai:
+  enabled: true
+  model: MiniMax-M2.7
+  max_tokens: 4096                 # MiniMax is verbose — low values leave no room for the JSON reply
+  thinking: false                  # set true for extended thinking (slower)
+  max_leverage: 20                 # hard cap on leverage the AI may request
+  kline_history: 50                # 15m candles fed to the model
+  htf_history: 30                  # (reserved for future use)
+  request_timeout_s: 90
+  retries: 2

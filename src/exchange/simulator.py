@@ -16,10 +16,12 @@ from loguru import logger
 
 from .base import (
     ExchangeInterface,
+    LimitOrder,
     LivePosition,
     OrderResult,
     OrderSide,
     SymbolFilters,
+    TickerInfo,
 )
 
 
@@ -33,6 +35,15 @@ class _SimPosition:
     qty: float
     entry_price: float
     leverage: int
+
+
+@dataclass
+class _SimLimitOrder:
+    order_id: str
+    symbol: str
+    side: OrderSide
+    qty: float
+    price: float
 
 
 class SimulatorExchange(ExchangeInterface):
@@ -51,7 +62,9 @@ class SimulatorExchange(ExchangeInterface):
         self._taker_fee = taker_fee_pct / 100.0
         self._slippage_ticks = slippage_ticks
         self._positions: Dict[str, _SimPosition] = {}
+        self._pending_orders: Dict[str, _SimLimitOrder] = {}
         self._filters_cache: Dict[str, SymbolFilters] = {}
+        self._all_filters_cache: Optional[Dict[str, SymbolFilters]] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._order_seq = 0
 
@@ -73,6 +86,12 @@ class SimulatorExchange(ExchangeInterface):
         return self._session
 
     async def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        async with self._s().get(BINANCE_FAPI + path, params=params) as r:
+            r.raise_for_status()
+            return await r.json()
+
+    async def _get_json(self, path: str, params: Optional[dict] = None):
+        """Like _get but returns the raw JSON (may be list or dict)."""
         async with self._s().get(BINANCE_FAPI + path, params=params) as r:
             r.raise_for_status()
             return await r.json()
@@ -245,6 +264,179 @@ class SimulatorExchange(ExchangeInterface):
                 leverage=p.leverage,
             ))
         return out
+
+    # ---- limit order interface ----
+
+    _MAKER_FEE = 0.0002  # 0.02%
+
+    async def limit_order(
+        self, symbol: str, side: OrderSide, qty: float, price: float,
+    ) -> str:
+        self._order_seq += 1
+        order_id = f"SIM-L-{self._order_seq}"
+        self._pending_orders[order_id] = _SimLimitOrder(
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            price=price,
+        )
+        logger.info(
+            "[SIM] LIMIT {} {} qty={} @ {:.6f}  id={}",
+            side, symbol, qty, price, order_id,
+        )
+        return order_id
+
+    async def get_open_orders(self, symbol: str) -> List[LimitOrder]:
+        return [
+            LimitOrder(
+                order_id=o.order_id,
+                symbol=o.symbol,
+                side=o.side,
+                qty=o.qty,
+                price=o.price,
+                status="NEW",
+            )
+            for o in self._pending_orders.values()
+            if o.symbol == symbol
+        ]
+
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        order = self._pending_orders.get(order_id)
+        if order is None or order.symbol != symbol:
+            return False
+        del self._pending_orders[order_id]
+        logger.info("[SIM] CANCEL order {}  {}", order_id, symbol)
+        return True
+
+    async def cancel_all_orders(self, symbol: str) -> int:
+        to_remove = [
+            oid for oid, o in self._pending_orders.items()
+            if o.symbol == symbol
+        ]
+        for oid in to_remove:
+            del self._pending_orders[oid]
+        if to_remove:
+            logger.info(
+                "[SIM] CANCEL ALL {} orders for {}", len(to_remove), symbol,
+            )
+        return len(to_remove)
+
+    def check_limit_fills(
+        self, symbol: str, mark_price: float,
+    ) -> List[LimitOrder]:
+        """Check pending limit orders against *mark_price* and fill those
+        that would have been matched.  Called by the bot's main loop each tick.
+
+        Returns a list of :class:`LimitOrder` objects with status ``FILLED``.
+        """
+        filled: List[LimitOrder] = []
+        to_remove: List[str] = []
+
+        for oid, order in self._pending_orders.items():
+            if order.symbol != symbol:
+                continue
+
+            should_fill = (
+                (order.side == "BUY" and mark_price <= order.price)
+                or (order.side == "SELL" and mark_price >= order.price)
+            )
+            if not should_fill:
+                continue
+
+            notional = order.price * order.qty
+            fee = notional * self._MAKER_FEE
+            self._balance -= fee
+
+            filled.append(LimitOrder(
+                order_id=order.order_id,
+                symbol=order.symbol,
+                side=order.side,
+                qty=order.qty,
+                price=order.price,
+                status="FILLED",
+                filled_qty=order.qty,
+                filled_price=order.price,
+                fee=fee,
+            ))
+            to_remove.append(oid)
+
+            logger.info(
+                "[SIM] LIMIT FILL {} {} qty={} @ {:.6f}  fee={:.5f}  bal={:.4f}",
+                order.side, order.symbol, order.qty, order.price,
+                fee, self._balance,
+            )
+
+        for oid in to_remove:
+            del self._pending_orders[oid]
+
+        return filled
+
+    # ---- symbol scanning ----
+
+    async def get_all_tickers(self) -> List[TickerInfo]:
+        raw = await self._get_json("/fapi/v1/ticker/24hr")
+        tickers: List[TickerInfo] = []
+        for t in raw:
+            sym = t.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            try:
+                tickers.append(TickerInfo(
+                    symbol=sym,
+                    price=float(t["lastPrice"]),
+                    volume_24h=float(t["quoteVolume"]),
+                    change_pct_24h=float(t["priceChangePercent"]),
+                    high_24h=float(t["highPrice"]),
+                    low_24h=float(t["lowPrice"]),
+                ))
+            except (KeyError, ValueError):
+                continue
+        return tickers
+
+    async def get_all_symbol_filters(self) -> Dict[str, SymbolFilters]:
+        if self._all_filters_cache is not None:
+            return self._all_filters_cache
+
+        info = await self._get("/fapi/v1/exchangeInfo")
+        result: Dict[str, SymbolFilters] = {}
+        for s in info["symbols"]:
+            sym = s.get("symbol", "")
+            if s.get("contractType") != "PERPETUAL":
+                continue
+            if s.get("status") != "TRADING":
+                continue
+            tick = 0.0001
+            step = 0.001
+            min_qty = 0.001
+            min_notional = 5.0
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                elif f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+                    min_qty = float(f["minQty"])
+                elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
+                    min_notional = float(
+                        f.get("notional") or f.get("minNotional") or 5.0
+                    )
+            sf = SymbolFilters(
+                symbol=sym,
+                price_tick=tick,
+                qty_step=step,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
+            result[sym] = sf
+            # Also populate per-symbol cache for get_symbol_filters()
+            self._filters_cache[sym] = sf
+
+        self._all_filters_cache = result
+        logger.info(
+            "[SIM] Cached symbol filters for {} perpetual contracts",
+            len(result),
+        )
+        return result
 
 
 __all__ = ["SimulatorExchange"]

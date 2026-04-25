@@ -21,6 +21,12 @@ class Secrets(BaseSettings):
     telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
     run_mode: Literal["sim", "live"] = Field(default="sim", alias="RUN_MODE")
 
+    # MiniMax (Anthropic-compatible) API — the AI brain driving trade decisions
+    ai_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
+    ai_base_url: str = Field(
+        default="https://api.minimax.io/anthropic", alias="ANTHROPIC_BASE_URL"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -84,27 +90,166 @@ class TelegramConfig(BaseModel):
     daily_summary_utc_hour: int = 0
 
 
+class AIConfig(BaseModel):
+    """AI-driven strategy configuration (MiniMax M2.7 via Anthropic-compatible API)."""
+
+    enabled: bool = True
+    model: str = "MiniMax-M2.7"
+    max_tokens: int = 4096  # MiniMax writes a lot of reasoning text before JSON
+    thinking: bool = False  # set true to use extended thinking mode
+    max_leverage: int = 20  # hard cap on leverage the AI may request
+    kline_history: int = 50      # candles included in the prompt
+    htf_history: int = 30        # HTF candles included in the prompt
+    request_timeout_s: float = 90.0
+    retries: int = 2
+
+
+class GridConfig(BaseModel):
+    """Grid-specific settings. The AI sets the actual grid parameters
+    (symbol, upper/lower bounds, levels, leverage) at runtime; these are
+    constraints and defaults the AI must stay within.
+
+    Defaults are tuned from 20 real $10 trades: tight stops + 15x lev
+    + sub-minute churn produced consistent -$0.01..-$0.20 losses that
+    dwarfed the few winners. These wider parameters favour letting
+    winners run and cutting losers only on genuine break-down, not on
+    spread noise.
+    """
+
+    max_grids: int = 15               # max grid levels AI may create
+    min_grids: int = 3                # minimum grid levels
+    rebalance_check_minutes: int = 15 # how often to ask AI to re-evaluate
+    out_of_range_pct: float = 1.5     # % outside grid to trigger AI re-eval
+    max_unrealized_loss_pct: float = 5.0  # force-close grid if uPnL loss exceeds this (of equity)
+    max_capital_pct: float = 50.0     # max % of balance the grid may commit as margin (lower = more headroom for loaded grid to breathe)
+    max_leverage: int = 5             # hard cap on grid leverage (best winner was 5x)
+    # Per-tick position safety
+    position_stop_loss_pct: float = 4.0   # close grid if price moves this far adverse from avg_entry
+    drift_exit_pct: float = 3.0           # exit if price drifts this far from grid center (trend emerging)
+    take_profit_pct: float = 2.5          # lock in when actual gain (equity delta) >= this % of start equity
+    trailing_tp_arm_pct: float = 1.5      # arm trailing TP once gain reaches this % of start equity
+    trailing_tp_giveback_pct: float = 0.5 # from peak gain, exit if we give back this much of start equity
+    take_profit_streak: int = 2           # require this many consecutive ticks over TP to actually fire
+    min_hold_minutes: int = 5             # don't TP/stop before grid has had time to breathe
+    symbol_cooldown_minutes: int = 120    # after EXIT/stop, don't re-pick the same symbol for N min
+    post_exit_cooldown_minutes: int = 3   # after any close, pause bot entirely before starting new grid
+    min_volume_usd: float = 50_000_000    # reject illiquid symbols from scan
+    heartbeat_ticks: int = 30             # trade_log heartbeat every N ticks (0 = off)
+
+
+class DirectionalConfig(BaseModel):
+    """Regime-adaptive directional trading (long/short).
+
+    Enable by setting ``trading_mode: directional`` at the top level of
+    config.yaml. The bot scans for the highest-confidence market regime on
+    each tick and opens a single position with adaptive leverage sized so
+    the SL risks ``risk_per_trade_pct`` of current equity.
+    """
+
+    # Sizing / leverage
+    risk_per_trade_pct: float = 1.0        # % of equity risked per trade at SL
+    base_leverage: int = 3                 # preferred leverage when conditions neutral
+    min_leverage: int = 1
+    max_leverage: int = 20                 # hard cap
+    max_margin_pct: float = 85.0           # soft cap — normal trades stay under this % of equity
+    hard_margin_pct: float = 98.0          # hard cap — expensive assets can use up to this % (leaves ~2% for fees)
+
+    # Scanning
+    min_volume_usd: float = 50_000_000
+    scan_top_n: int = 0                    # 0 = scan every liquid symbol (one-by-one)
+    scan_max_ai_calls: int = 120           # safety cap on setup proposals per scan pass
+    scan_interval_seconds: int = 60        # min gap between scans when flat
+    min_confidence: float = 0.45           # reject if the strategy's self-confidence is below this
+    # Multi-timeframe analysis: top-down ordered list of timeframes used
+    # for level detection. Must be ordered HIGHEST -> LOWEST.
+    # Supported: 1d, 4h, 1h, 15m, 5m, 3m, 1m.
+    mtf_timeframes: List[str] = Field(
+        default_factory=lambda: ["1d", "4h", "1h", "15m"]
+    )
+
+    # Regime detection thresholds
+    adx_strong: float = 25.0
+    adx_weak: float = 18.0
+
+    # Position management
+    trail_atr_mult: float = 1.5
+    trail_arm_atr: float = 1.0             # arm trailing after +1 ATR profit
+    trail_tighten_atr: float = 2.0         # once profit >= N ATR, use tighter trail
+    trail_tighten_mult: float = 0.75       # trailing mult after tightening
+    breakeven_profit_pct: float = 0.4      # move SL to BE once uPnL% >= this
+    breakeven_buffer_atr: float = 0.1
+    breakeven_after_tp1: bool = True
+    giveback_arm_pct: float = 1.0          # arm giveback protection at this peak uPnL%
+    giveback_exit_pct: float = 0.6         # exit if we give back this much from peak
+    time_stop_hours: float = 24.0
+    max_loss_pct: float = 6.0              # hard cap % of open-equity
+
+
+class SRConfig(BaseModel):
+    """Deterministic support/resistance strategy parameters.
+
+    Used when ``trading_mode: directional`` (default). The directional
+    trader no longer calls an LLM — it runs this rule-based S/R engine
+    per candidate across three timeframes:
+
+      * ``level_timeframe``   — where swing pivots cluster into real
+        structural levels (default 1h: meaningful swings, not 15m noise).
+      * ``bias_timeframe``    — HTF EMA trend gate. 4h gives responsive
+        bias without the lag of a 1d EMA for intraday-to-swing entries.
+      * ``trigger_timeframe`` — rejection candle + entry price come from
+        here so we react quickly once HTF structure aligns.
+    """
+
+    # Timeframe layout.
+    level_timeframe: str = "1h"
+    bias_timeframe: str = "4h"
+    trigger_timeframe: str = "15m"
+
+    # Pivot detection — fractal-style swing on closed bars of the level TF.
+    # Wider windows on 1h reduce noise and keep only meaningful swings.
+    pivot_left: int = 4
+    pivot_right: int = 4
+    max_lookback_bars: int = 200           # keep levels found within last N closed bars
+
+    # Clustering — pivots within tolerance*ATR collapse to one level.
+    level_tolerance_atr: float = 0.4
+    min_touches: int = 2                   # discard one-off pivots
+    min_level_strength: float = 2.0        # composite strength threshold
+
+    # Setup rules.
+    htf_trend_ema: int = 50                # EMA period on the bias TF
+    entry_zone_atr: float = 0.5            # trigger-price must be within N * level_ATR of the level
+    sl_buffer_atr: float = 0.6             # SL = level -/+ buffer * level_ATR
+    min_rr: float = 1.5                    # final TP must give at least this R:R
+    max_tp_levels: int = 3                 # max TP ladder steps
+    require_rejection_candle: bool = True  # demand a confirmation candle on trigger TF
+    max_rsi_for_long: float = 68.0
+    min_rsi_for_short: float = 32.0
+
+
+TradingMode = Literal["grid", "directional"]
+
+
 class BotConfig(BaseModel):
-    symbols: List[str] = Field(default_factory=lambda: ["DOGEUSDT"])
     timeframe: str = "15m"
     htf_timeframe: str = "1h"
-    leverage: int = 3
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED"
+    trading_mode: TradingMode = "directional"
     risk: RiskConfig = Field(default_factory=RiskConfig)
     strategy: StrategyConfig = Field(default_factory=StrategyConfig)
     exits: ExitsConfig = Field(default_factory=ExitsConfig)
     simulator: SimulatorConfig = Field(default_factory=SimulatorConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
-    loop_interval_seconds: int = 15
+    ai: AIConfig = Field(default_factory=AIConfig)
+    grid: GridConfig = Field(default_factory=GridConfig)
+    directional: DirectionalConfig = Field(default_factory=DirectionalConfig)
+    sr: SRConfig = Field(default_factory=SRConfig)
+    loop_interval_seconds: int = 10
     kline_history: int = 200
     log_level: str = "INFO"
     log_file: str = "logs/bot.log"
+    trade_log_file: str = "logs/trades.log"
     state_file: str = "state/bot_state.json"
-
-    @field_validator("symbols")
-    @classmethod
-    def uppercase_symbols(cls, v: List[str]) -> List[str]:
-        return [s.upper().strip() for s in v]
 
 
 # --- Loader ---
